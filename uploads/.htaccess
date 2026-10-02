@@ -1,0 +1,6 @@
+# 安全加固：uploads 仅用于存放上传的媒体文件，禁止脚本解析执行
+Options -Indexes
+AddType text/plain .php .php3 .php4 .php5 .php6 .php7 .php8 .phtml .phar .pht .shtml .cgi .pl .py .asp .aspx .jsp .sh
+<FilesMatch "\.(php|php3|php4|php5|php6|php7|php8|phtml|phar|pht|shtml|cgi|pl|py|asp|aspx|jsp|sh|htaccess)$">
+  Require all denied
+</FilesMatch>
