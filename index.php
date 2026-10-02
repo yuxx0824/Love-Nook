@@ -1,0 +1,1399 @@
+<?php
+require __DIR__ . '/include/bootstrap.php';
+$ROOT = __DIR__;
+$UPLOAD_DIR = $ROOT . '/uploads/';
+if (!is_dir($UPLOAD_DIR)) mkdir($UPLOAD_DIR, 0755, true);
+
+// 表未建好时引导去迁移
+try {
+    db()->query('SELECT 1 FROM cp_config LIMIT 1');
+} catch (Throwable $e) {
+    header('Content-Type: text/html; charset=utf-8');
+    echo '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>需要初始化</title></head><body style="font-family:sans-serif;padding:40px;max-width:640px;margin:auto">';
+    echo '<h2>数据库尚未初始化</h2>';
+    echo '<p>请先打开：<a href="migrate.php">migrate.php</a> 完成建表与数据迁移。</p>';
+    echo '<p>然后打开：<a href="dbtest.php">dbtest.php</a> 检查连接。</p>';
+    echo '<pre style="background:var(--soft);padding:12px;border-radius:8px;white-space:pre-wrap">' . htmlspecialchars($e->getMessage()) . '</pre>';
+    echo '</body></html>';
+    exit;
+}
+
+require_csrf();
+
+$me = $_SESSION['user'] ?? (isset($_SESSION['cp_admin']) ? ['id' => 'admin', 'nickname' => '管理员', 'avatar_color' => '#4a90d9'] : null);
+$clientIp = client_ip();
+$commentMsg = $commentErr = '';
+$userPostMsg = $userPostErr = '';
+$C = get_config();
+
+// 先处理 POST，成功后 PRG 跳转，避免重复提交并防止访问量误计
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['act'] ?? '') === 'logout') {
+    session_destroy();
+    header('Location: index.php');
+    exit;
+}
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['act'] ?? '') === 'comment') {
+    if (!($C['show_comments'] ?? 1)) {
+        $commentErr = '评论功能已关闭';
+    } elseif (!$me) {
+        $commentErr = '请先登录后再评论';
+    } else {
+        $postId = trim($_POST['post_id'] ?? '');
+        $text = trim($_POST['text'] ?? '');
+        $text = filter_text($text);
+        $parentId = trim($_POST['parent_id'] ?? '');
+        $nick = $me['nickname'];
+        $userId = $me['id'];
+    }
+    
+    if (!$commentErr) {
+        if (empty($text)) {
+            $commentErr = '请填写留言内容';
+        } elseif (mb_strlen($text) > 500) {
+            $commentErr = '留言过长（最多500字）';
+        } elseif (!post_exists($postId)) {
+            $commentErr = '说说不存在或已删除';
+        } else {
+            $cmtRisk = content_risk_reason(trim($_POST['text'] ?? ''));
+            $commentData = [
+                'id' => new_id(), 'post_id' => $postId, 'nick' => $nick,
+                'text' => $text, 'ip' => $clientIp,
+                'user_id' => $userId, 'time' => date('Y-m-d H:i:s'),
+                'visible' => $cmtRisk === '' ? 1 : 0,
+            ];
+            if ($parentId !== '') {
+                $commentData['parent_id'] = $parentId;
+            }
+            comment_insert($commentData);
+            // 命中风险的内容不触发 AI 回复，避免把注入内容喂给模型
+            if ($cmtRisk === '' && file_exists(__DIR__ . '/admin/modules/ai.php')) {
+                require_once __DIR__ . '/admin/modules/ai.php';
+                ai_auto_reply_on_comment($commentData);
+            }
+            header('Location: index.php?p=posts&' . ($cmtRisk === '' ? 'cmt=1' : 'cmt=hold'));
+            exit;
+        }
+    }
+}
+// 编辑留言
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['act'] ?? '') === 'edit_comment') {
+    if (!$me) {
+        $commentErr = '请先登录';
+    } else {
+        $cid = trim($_POST['comment_id'] ?? '');
+        $text = trim($_POST['text'] ?? '');
+        $text = filter_text($text);
+        if (empty($cid) || empty($text)) {
+            $commentErr = '参数错误';
+        } elseif (mb_strlen($text) > 500) {
+            $commentErr = '留言过长（最多500字）';
+        } else {
+            // 权限校验：仅管理员或留言作者本人可编辑
+            $st = db()->prepare('SELECT user_id FROM cp_comments WHERE id=?');
+            $st->execute([$cid]);
+            $owner = $st->fetchColumn();
+            if ($owner === false) {
+                $commentErr = '留言不存在或已删除';
+            } elseif (!isset($_SESSION['cp_admin']) && ($owner === null || $owner === '' || $owner !== $me['id'])) {
+                $commentErr = '无权编辑该留言';
+            } else {
+                $editRisk = content_risk_reason(trim($_POST['text'] ?? ''));
+                comment_update($cid, $text);
+                if ($editRisk !== '') {
+                    comment_set_visible($cid, 0);
+                    header('Location: index.php?p=posts&cmt=hold');
+                    exit;
+                }
+                header('Location: index.php?p=posts&cmt=edit');
+                exit;
+            }
+        }
+    }
+}
+// 删除留言
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['act'] ?? '') === 'delete_comment') {
+    if (!$me) {
+        $commentErr = '请先登录';
+    } else {
+        $cid = trim($_POST['comment_id'] ?? '');
+        if (empty($cid)) {
+            $commentErr = '参数错误';
+        } else {
+            // 权限校验：仅管理员或留言作者本人可删除
+            $st = db()->prepare('SELECT user_id FROM cp_comments WHERE id=?');
+            $st->execute([$cid]);
+            $owner = $st->fetchColumn();
+            if ($owner === false) {
+                $commentErr = '留言不存在或已删除';
+            } elseif (!isset($_SESSION['cp_admin']) && ($owner === null || $owner === '' || $owner !== $me['id'])) {
+                $commentErr = '无权删除该留言';
+            } else {
+                // 级联删除该留言及其下的回复，并清理点赞记录
+                $replyIds = [];
+                $st = db()->prepare('SELECT id FROM cp_comments WHERE parent_id=?');
+                $st->execute([$cid]);
+                while ($rid = $st->fetchColumn()) { $replyIds[] = $rid; }
+                $ids = array_merge([$cid], $replyIds);
+                $ph = implode(',', array_fill(0, count($ids), '?'));
+                db()->prepare("DELETE FROM cp_comments WHERE id IN ($ph)")->execute($ids);
+                try {
+                    db()->prepare("DELETE FROM cp_comment_likes WHERE comment_id IN ($ph)")->execute($ids);
+                } catch (Throwable $e) {}
+                header('Location: index.php?p=posts&cmt=del');
+                exit;
+            }
+        }
+    }
+}
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['act'] ?? '') === 'user_post') {
+    if (!($C['show_user_posts'] ?? 1)) {
+        $userPostErr = '发说说功能已关闭';
+    } elseif (!$me) {
+        $userPostErr = '请先登录！';
+    } else {
+        $rawContent = trim($_POST['content'] ?? '');
+    $content = filter_text($rawContent);
+    $postHideReason = content_risk_reason($rawContent);
+        if (empty($content)) {
+            $userPostErr = '说说内容不能为空！';
+        } elseif (mb_strlen($content) > 2000) {
+            $userPostErr = '内容过长（最多2000字）';
+        } else {
+            $imgs = safe_upload_multi('images', $UPLOAD_DIR, ['jpg','jpeg','png','gif','webp'],
+                ['image/jpeg','image/png','image/gif','image/webp']);
+            $video = safe_upload_one('video', $UPLOAD_DIR, ['mp4','webm','mov','avi','mkv'],
+                ['video/mp4','video/webm','video/quicktime']);
+            $music = safe_upload_one('music', $UPLOAD_DIR, ['mp3','wav','ogg','m4a','aac','flac'],
+                ['audio/mpeg','audio/wav','audio/ogg','audio/mp4','audio/aac','audio/flac']);
+            post_insert([
+                'id' => new_id(), 'title' => '', 'tags' => [], 'content' => $content,
+                'author' => '1', 'mood' => '💕', 'time' => date('Y-m-d H:i:s'),
+                'images' => $imgs, 'video' => $video, 'music' => $music,
+                'ip' => $clientIp, 'location' => resolve_location($clientIp),
+                'user_id' => $me['id'], 'user_nick' => $me['nickname'],
+                'user_color' => $me['avatar_color'] ?? '#d4786e',
+                'visible' => $postHideReason === '' ? 1 : 0,
+            ]);
+            header('Location: index.php?p=posts&posted=' . ($postHideReason === '' ? '1' : 'hold'));
+            exit;
+        }
+    }
+}
+
+if (isset($_GET['cmt'])) {
+    $cmtFlag = (string)$_GET['cmt'];
+    if ($cmtFlag === 'hold') $commentMsg = '留言已提交，内容待管理员审核后显示 💕';
+    elseif ($cmtFlag === 'edit') $commentMsg = '留言已更新';
+    elseif ($cmtFlag === 'del') $commentMsg = '留言已删除';
+    else $commentMsg = '留言成功！💕';
+}
+if (isset($_GET['posted'])) $userPostMsg = ($_GET['posted'] === 'hold') ? '说说已提交，内容待管理员审核后显示 💕' : '发布成功！💕';
+
+$P = posts_all(false);
+$PL = places_all();
+$T = todos_all();
+$PH = photos_all();
+$PG = pages_all();
+$CM = comments_all(false);
+$V = bump_visit();
+
+// 预计算当前用户对所有评论的点赞状态
+$allCommentIds = [];
+foreach ($CM as $c) { if (!empty($c['id'])) $allCommentIds[] = $c['id']; }
+$likedComments = [];
+if ($me && !empty($allCommentIds)) {
+    $likedComments = comment_likes_status($allCommentIds, $me['id']);
+}
+
+
+
+$n1 = $C['name1'] ?? '男神';
+$n2 = $C['name2'] ?? '女神';
+$a1 = !empty($C['avatar1']) ? $C['avatar1'] : '';
+$a2 = !empty($C['avatar2']) ? $C['avatar2'] : '';
+$ld = $C['love_date'] ?? '2024-01-01';
+$bn = $C['beian'] ?? '本站由小兔云提供技术支持 · 仅供个人使用';
+$st = ($C['site_title'] ?? '') ?: "$n1 ❤ $n2";
+$ds = floor((time() - strtotime($ld)) / 86400);
+$y = floor($ds / 365); $m = floor(($ds % 365) / 30); $d = ($ds % 365) % 30;
+
+function TA($dt) {
+    $df = time() - strtotime($dt);
+    if ($df < 60) return '刚刚';
+    if ($df < 3600) return floor($df/60).'分钟前';
+    if ($df < 86400) return floor($df/3600).'小时前';
+    if ($df < 2592000) return floor($df/86400).'天前';
+    return date('Y-m-d', strtotime($dt));
+}
+function AV($u, $e) {
+    if ($u) return '<img src="'.htmlspecialchars($u, ENT_QUOTES).'" alt="avatar" style="width:100%;height:100%;object-fit:cover;border-radius:50%;">';
+    return htmlspecialchars($e);
+}
+
+$pg = $_GET['p'] ?? 'home';
+if (($_GET['act'] ?? '') === 'logout') { session_destroy(); header('Location: index.php'); exit; }
+$validPages = ['home','posts','album','places','todos','post'];
+$customSlugs = [];
+foreach ($PG as $cp) {
+    if (!empty($cp['slug'])) { $validPages[] = $cp['slug']; $customSlugs[$cp['slug']] = $cp; }
+}
+if (!in_array($pg, $validPages)) $pg = 'home';
+$isCustomPage = isset($customSlugs[$pg]);
+$cp = $isCustomPage ? $customSlugs[$pg] : null;
+
+function NI($pg, $cur, $i) {
+    $a = ($pg === $cur) ? ' class="active"' : '';
+    $lb = ['home'=>'首页','posts'=>'说说','album'=>'相册','places'=>'足迹','todos'=>'清单'];
+    $l = isset($lb[$pg]) ? $lb[$pg] : $pg;
+    return '<a href="?p='.htmlspecialchars($pg).'"'.$a.'><span class="ni">'.m_ico($i,19).'</span><span class="nl">'.$l.'</span></a>';
+}
+$DN = count(array_filter($T, function($t){return !empty($t['done']);}));
+
+function renderCommentItem($ct, $pid, $parentId, $likedComments, $me, $replyToNick = '') {
+    $cid = $ct['id'];
+    $likeType = $likedComments[$cid] ?? null;
+    $likeCount = (int)($ct['likes'] ?? 0);
+    $likeCls = $likeType === 'like' ? 'liked' : '';
+    $dislikeCls = $likeType === 'dislike' ? 'liked' : '';
+
+    // 头像
+    $cAv = $ct['user_avatar'] ?? '';
+    $cColor = $ct['user_avatar_color'] ?? '#d4786e';
+    $cEmoji = '👤';
+    $avatarHtml = $cAv
+        ? '<img src="'.htmlspecialchars($cAv).'" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%">'
+        : htmlspecialchars($cEmoji);
+
+    // 名称+徽标
+    $badgeHtml = '';
+    if ($ct['user_id'] === 'admin') {
+        $badgeHtml = ' <span class="cmt-badge admin">管理员</span>';
+    } elseif (!empty($ct['user_id'])) {
+        $badgeHtml = '';
+    } else {
+        $badgeHtml = ' <span class="cmt-badge guest">游客</span>';
+    }
+
+    // 位置
+    $loc = !empty($ct['user_location']) && $ct['user_location'] !== '未知' ? htmlspecialchars($ct['user_location']) : '';
+
+    $o = '<div class="cmt-item" id="cmt-'.htmlspecialchars($cid).'">';
+    // 头像可点击跳转主页
+    $avatarLink = (!empty($ct['user_id']) && $ct['user_id'] !== 'admin');
+    if ($avatarLink) {
+        $o .= '<a href="user.php?id='.htmlspecialchars($ct['user_id']).'" class="cmt-avatar-link">';
+    }
+    $o .= '<div class="cmt-avatar" style="background:'.htmlspecialchars($cColor).'">'.$avatarHtml.'</div>';
+    if ($avatarLink) {
+        $o .= '</a>';
+    }
+    $o .= '<div class="cmt-main">';
+    $o .= '<div class="cmt-top-row">';
+    $o .= '<span class="cmt-name">'.htmlspecialchars($ct['nick']).'</span>'.$badgeHtml;
+    if ($replyToNick !== '') {
+        $o .= '<span class="cmt-reply-to">↩ 回复 @'.htmlspecialchars($replyToNick).'</span>';
+    }
+    $o .= '</div>';
+    $o .= '<div class="cmt-text">'.nl2br(htmlspecialchars(preg_replace('/\[图片\](?:https?:\/\/|\/)[^\s<>"\']+\s*/i', '', $ct['text']))).'</div>';
+    // 图片留言 - 解析文本中的图片标记 [图片]url
+    if (preg_match_all('/\[图片\]((?:https?:\/\/|\/)[^\s<>"\']+)/i', $ct['text'], $m)) {
+        foreach ($m[1] as $imgUrl) {
+            $o .= '<div class="cmt-image"><img src="'.htmlspecialchars($imgUrl).'" onclick="l(\''.htmlspecialchars($imgUrl, ENT_QUOTES).'\')" loading="lazy"></div>';
+        }
+    }
+    $o .= '<div class="cmt-actions">';
+    // 左侧：时间 · 地区（合并到一行，内容下方）
+    $metaParts = array(date('m-d', strtotime($ct['time'])));
+    if ($loc) $metaParts[] = $loc;
+    $o .= '<span class="cmt-meta">'.implode(' · ', $metaParts).'</span>';
+    // 回复、编辑、删除
+    $o .= '<span class="cmt-reply-btn" onclick="showReplyForm(\''.htmlspecialchars($parentId ?: $cid).'\',\''.htmlspecialchars(addslashes($ct['nick'])).'\',\''.htmlspecialchars($pid).'\')">回复</span>';
+    // 管理员可编辑/删除
+    if ($me && $me['id'] === 'admin') {
+        $o .= '<span class="cmt-action-btn cmt-edit-btn" onclick="editComment(\''.htmlspecialchars($cid).'\',\''.htmlspecialchars($pid).'\')">编辑</span>';
+        $o .= '<span class="cmt-action-btn cmt-del-btn" onclick="if(confirm(\'确定删除这条留言？\')){var f=document.createElement(\'form\');f.method=\'post\';f.innerHTML=\'<input type=hidden name=_csrf value='.htmlspecialchars(csrf_token()).'><input type=hidden name=act value=delete_comment><input type=hidden name=comment_id value='.htmlspecialchars($cid).'>\';document.body.appendChild(f);f.submit()}">删除</span>';
+    }
+    // 右侧：两个爱心（❤️ 点赞 / 💔 心碎），靠右
+    $o .= '<span class="cmt-like-actions">';
+    $o .= '<span class="cmt-like-btn like-heart '.$likeCls.'" data-cid="'.htmlspecialchars($cid).'" data-pid="'.htmlspecialchars($pid).'">' . m_ico('heart', 14) . ' <span class="cmt-like-num">'.($likeCount > 0 ? $likeCount : '').'</span></span>';
+    $o .= '<span class="cmt-like-btn dislike-heart '.$dislikeCls.'" data-cid="'.htmlspecialchars($cid).'" data-pid="'.htmlspecialchars($pid).'">' . m_ico('heart', 14) . '</span>';
+    $o .= '</span>';
+    $o .= '</div>';
+    $o .= '</div></div>';
+    // 编辑表单（默认隐藏）
+    if ($me && $me['id'] === 'admin') {
+        $o .= '<div class="cmt-edit-form" id="cmt-edit-'.htmlspecialchars($cid).'" style="display:none">';
+        $o .= '<form method="post" class="cmt-form">'.csrf_field();
+        $o .= '<input type="hidden" name="act" value="edit_comment">';
+        $o .= '<input type="hidden" name="comment_id" value="'.htmlspecialchars($cid).'">';
+        $o .= '<textarea name="text" required maxlength="500" rows="2">'.htmlspecialchars($ct['text']).'</textarea>';
+        $o .= '<div style="display:flex;gap:6px;width:100%">';
+        $o .= '<button type="submit">保存</button>';
+        $o .= '<button type="button" class="cmt-cancel-btn" onclick="cancelEdit(\''.htmlspecialchars($cid).'\',\''.htmlspecialchars($pid).'\')">取消</button>';
+        $o .= '</div>';
+        $o .= '</form></div>';
+    }
+    return $o;
+}
+
+function renderPostCard($po, $CM, $n1, $n2, $a1, $a2, $me, $likedComments, $collapsed = false, $fullContent = false) {
+    $pid = $po['id'] ?? '';
+    $isUserPost = !empty($po['user_id']);
+    if ($isUserPost) {
+        $pav = $po['user_avatar'] ?? '';
+        $pem = '👤';
+        $pname = htmlspecialchars($po['user_nick'] ?? '用户');
+        $pcolor = '#888';
+    } else {
+        $pav = ($po['author']??'1')==='1'?$a1:$a2;
+        $pem = ($po['author']??'1')==='1'?'👦':'👧';
+        $pname = htmlspecialchars(($po['author']??'1')==='1'?$n1:$n2);
+        $pcolor = '';
+    }
+    $postComments = [];
+    foreach ($CM as $c) { if (($c['post_id'] ?? '') === $pid) $postComments[] = $c; }
+    $cc = count($postComments);
+    $o = '<div class="ncs pc">';
+    $o .= '<div class="ph"><div class="pa"'.($isUserPost?' style="background:'.htmlspecialchars($po['user_color']??'#d4786e').'"':'').'>'.($isUserPost?'<a href="user.php?id='.htmlspecialchars($po['user_id']).'" style="display:flex;width:100%;height:100%;align-items:center;justify-content:center;">':'').AV($pav,$pem).($isUserPost?'</a>':'').'</div><div class="pi"><div class="name"'.($pcolor?' style="color:'.$pcolor.'"':'').'>'.($isUserPost?'<a href="user.php?id='.htmlspecialchars($po['user_id']).'" style="color:var(--tx);text-decoration:none">':'').$pname.($isUserPost?'</a>':'').'</div><div class="time">'.htmlspecialchars($po['time']).(!empty($po['location'])&&$po['location']!=='未知'?' · 📍 '.htmlspecialchars($po['location']):'').($isUserPost?' · <a href="user.php?id='.htmlspecialchars($po['user_id']).'" style="color:var(--tl);text-decoration:none">用户</a>':'').'</div></div><div class="pm">'.htmlspecialchars($po['mood']??'💕').'</div></div>';
+    if(!empty($po['title'])) $o .= '<div class="ptitle">'.htmlspecialchars($po['title']).'</div>';
+    // 内容截断
+    $contentText = str_replace("\r\n", "\n", str_replace("\r", "\n", $po['content']));
+    $truncateLen = 120;
+    if (!$fullContent && mb_strlen($contentText) > $truncateLen) {
+        $displayText = md_truncate($contentText, $truncateLen) . '…';
+        $o .= '<div class="pb">'.md_render($displayText).'</div>';
+        $o .= '<div class="read-more"><a href="?p=post&amp;id='.htmlspecialchars($pid).'">查看全文 →</a></div>';
+    } else {
+        $o .= '<div class="pb">'.md_render($contentText).'</div>';
+    }
+    if(!empty($po['tags'])) { $o .= '<div class="ptags">'; foreach($po['tags'] as $t) $o .= '<span class="tag">#'.htmlspecialchars($t).'</span>'; $o .= '</div>'; }
+    if(!empty($po['images'])) { $o .= '<div class="pimgs'.((count($po['images'])===1)?' c1':((count($po['images'])===2)?' c2':'')).'">'; foreach($po['images'] as $im) $o .= '<img src="'.htmlspecialchars($im).'" onclick="l(\''.htmlspecialchars($im,ENT_QUOTES).'\')" loading="lazy">'; $o .= '</div>'; }
+    if(!empty($po['video'])) {
+        $vRaw = $po['video'];
+        $vJson = null;
+        if (is_string($vRaw) && strpos(ltrim($vRaw), '{') === 0) {
+            $vJson = json_decode($vRaw, true);
+        }
+        if (is_array($vJson)) {
+            // 抖音等分享链接元数据（非直接视频地址）：显示封面+提示
+            $vCover = $vJson['cover'] ?? '';
+            $o .= '<div class="pvideo pvideo-ext"><a href="https://www.douyin.com/video/'.htmlspecialchars($vJson['video_id'] ?? '').'" target="_blank" rel="noopener">';
+            if ($vCover) $o .= '<img src="'.htmlspecialchars($vCover).'" alt="抖音视频封面" loading="lazy" onerror="this.style.display=\'none\'">';
+            $o .= '<span class="pvideo-play">▶ 来自抖音，点击打开</span></a></div>';
+        } else {
+            $o .= '<div class="pvideo"><video src="'.htmlspecialchars($vRaw).'" controls preload="metadata" style="width:100%;max-height:400px;border-radius:var(--rx)">您的浏览器不支持视频播放</video></div>';
+        }
+    }
+    if(!empty($po['music'])) { $o .= '<div class="pmusic"><audio src="'.htmlspecialchars($po['music']).'" controls preload="metadata" style="width:100%">您的浏览器不支持音频播放</audio></div>'; }
+
+    // ---- 新版评论区 ----
+    $o .= '<div class="cmt-section'.($collapsed ? ' cmt-home-collapsed' : '').'">';
+
+    if ($collapsed) {
+        $topCommentCount = count($postComments);
+        $ccText = $topCommentCount > 0 ? $topCommentCount.' 条留言' : '留言';
+        $o .= '<div class="cmt-toggle" data-pid="'.htmlspecialchars($pid).'" onclick="var tx=this.querySelector(\'.ct-tx\'),bd=this.nextElementSibling;if(bd.style.display===\'block\'){bd.style.display=\'none\';tx.textContent=\'' . $ccText . '\';this.classList.remove(\'expanded\')}else{bd.style.display=\'block\';tx.textContent=\'收起\';this.classList.add(\'expanded\')}"><span class="ct-ic">' . m_ico('comment', 14) . '</span><span class="ct-tx">' . $ccText . '</span></div>';
+        $o .= '<div class="cmt-body" style="display:none">';
+    }
+
+    // Separate top-level and reply comments
+    $topComments = [];
+    $replies = [];
+    foreach ($postComments as $ct) {
+        if (empty($ct['parent_id'])) {
+            $topComments[] = $ct;
+        } else {
+            $replies[$ct['parent_id']][] = $ct;
+        }
+    }
+
+    // 展示前2条热门评论 + 展开更多
+    $showCount = min(count($topComments), 2);
+    $hiddenCount = count($topComments) - $showCount;
+
+    for ($i = 0; $i < $showCount; $i++) {
+        $ct = $topComments[$i];
+        $cid = $ct['id'];
+        $o .= renderCommentItem($ct, $pid, '', $likedComments, $me);
+
+        // 展开回复
+        if (isset($replies[$cid])) {
+            $rpList = $replies[$cid];
+            $rpTotal = count($rpList);
+            if ($rpTotal > 2) {
+                $o .= '<div class="cmt-expand-replies" data-cid="'.htmlspecialchars($cid).'" data-pid="'.htmlspecialchars($pid).'">';
+                $o .= '<div class="cmt-expand-btn" onclick="toggleReplies(this,\''.htmlspecialchars($cid).'\')">展开 '.$rpTotal.' 条回复 ▾</div>';
+                $o .= '<div class="cmt-replies-list" style="display:none">';
+                foreach ($rpList as $rp) {
+                    $o .= renderCommentItem($rp, $pid, $cid, $likedComments, $me, (string)($ct['nick'] ?? ''));
+                }
+                $o .= '</div></div>';
+            } else {
+                $o .= '<div class="cmt-replies-inline">';
+                foreach ($rpList as $rp) {
+                    $o .= renderCommentItem($rp, $pid, $cid, $likedComments, $me, (string)($ct['nick'] ?? ''));
+                }
+                $o .= '</div>';
+            }
+        }
+    }
+
+    if ($hiddenCount > 0) {
+        $o .= '<div class="cmt-show-more" onclick="this.style.display=\'none\';var p=this.parentElement;var all=p.querySelectorAll(\'.cmt-item-hidden,.cmt-expand-replies-hidden\');for(var i=0;i<all.length;i++)all[i].style.display=\'\'">展开全部 '.$hiddenCount.' 条留言 ▾</div>';
+    }
+
+    // 隐藏的评论（从第3条开始）
+    for ($i = $showCount; $i < count($topComments); $i++) {
+        $ct = $topComments[$i];
+        $cid = $ct['id'];
+        $o .= '<div class="cmt-item-hidden" style="display:none">';
+        $o .= renderCommentItem($ct, $pid, '', $likedComments, $me);
+        if (isset($replies[$cid])) {
+            $rpList = $replies[$cid];
+            $rpTotal = count($rpList);
+            $o .= '<div class="cmt-expand-replies-hidden" style="display:block" data-cid="'.htmlspecialchars($cid).'" data-pid="'.htmlspecialchars($pid).'">';
+            if ($rpTotal > 2) {
+                $o .= '<div class="cmt-expand-btn" onclick="toggleReplies(this,\''.htmlspecialchars($cid).'\')">展开 '.$rpTotal.' 条回复 ▾</div>';
+                $o .= '<div class="cmt-replies-list" style="display:none">';
+                foreach ($rpList as $rp) {
+                    $o .= renderCommentItem($rp, $pid, $cid, $likedComments, $me, (string)($ct['nick'] ?? ''));
+                }
+                $o .= '</div>';
+            } else {
+                $o .= '<div class="cmt-replies-inline">';
+                foreach ($rpList as $rp) {
+                    $o .= renderCommentItem($rp, $pid, $cid, $likedComments, $me, (string)($ct['nick'] ?? ''));
+                }
+                $o .= '</div>';
+            }
+            $o .= '</div>';
+        }
+        $o .= '</div>';
+    }
+
+    // 底部输入区
+    $o .= '<div class="cmt-input-bar" id="cmt-input-bar-'.htmlspecialchars($pid).'">';
+    if ($me) {
+        $o .= '<div class="cmt-avatar-mini" style="background:'.htmlspecialchars($me['avatar_color'] ?? '#d4786e').'">'.(($me['avatar'] ?? '') ? '<img src="'.htmlspecialchars($me['avatar']).'" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%">' : '👤').'</div>';
+        $o .= '<form method="post" class="cmt-inline-form">'.csrf_field();
+        $o .= '<input type="hidden" name="act" value="comment">';
+        $o .= '<input type="hidden" name="post_id" value="'.htmlspecialchars($pid).'">';
+        $o .= '<input type="hidden" name="parent_id" value="">';
+        $o .= '<div class="cmt-input-wrap">';
+        $o .= '<input type="text" name="text" placeholder="说点什么…" maxlength="500" class="cmt-inline-input" id="cmt-input-'.htmlspecialchars($pid).'">';
+        $o .= '<div class="cmt-input-tools">';
+        $o .= '<span class="cmt-tool-btn cmt-emoji-btn" onclick="toggleEmoji(this,\'cmt-input-'.htmlspecialchars($pid).'\')" title="表情">' . m_ico('smile', 15) . '</span>';
+        $o .= '<span class="cmt-tool-btn cmt-img-btn" onclick="insertImageUrl(\'cmt-input-'.htmlspecialchars($pid).'\')" title="图片">' . m_ico('album', 15) . '</span>';
+        $o .= '</div>';
+        $o .= '</div>';
+        $o .= '<button type="submit" class="cmt-inline-send">发送</button>';
+        $o .= '</form>';
+        $o .= '<div class="cmt-emoji-panel" id="cmt-emoji-panel-'.htmlspecialchars($pid).'" style="display:none" onclick="insertEmoji(event,this,\'cmt-input-'.htmlspecialchars($pid).'\')"></div>';
+    } else {
+        $o .= '<div class="cmt-login-bar"><a href="login.php">登录</a> 后才能评论</div>';
+    }
+    $o .= '</div>';
+
+    // 回复框（JS控制显隐）
+    if ($me) {
+        $o .= '<div class="cmt-reply-form" id="reply-form-'.htmlspecialchars($pid).'" style="display:none">';
+        $o .= '<form method="post" class="cmt-form">'.csrf_field();
+        $o .= '<input type="hidden" name="act" value="comment">';
+        $o .= '<input type="hidden" name="post_id" value="'.htmlspecialchars($pid).'">';
+        $o .= '<input type="hidden" name="parent_id" id="reply-parent-'.htmlspecialchars($pid).'" value="">';
+        $o .= '<div class="cmt-input-wrap" style="width:100%">';
+        $o .= '<textarea name="text" id="reply-text-'.htmlspecialchars($pid).'" placeholder="回复…" maxlength="500" rows="2" style="flex:1;min-width:0"></textarea>';
+        $o .= '<div class="cmt-input-tools" style="align-self:flex-end">';
+        $o .= '<span class="cmt-tool-btn cmt-emoji-btn" onclick="toggleEmoji(this,\'reply-text-'.htmlspecialchars($pid).'\')" title="表情">' . m_ico('smile', 15) . '</span>';
+        $o .= '<span class="cmt-tool-btn cmt-img-btn" onclick="insertImageUrl(\'reply-text-'.htmlspecialchars($pid).'\')" title="图片">' . m_ico('album', 15) . '</span>';
+        $o .= '</div>';
+        $o .= '</div>';
+        $o .= '<div style="display:flex;gap:6px;width:100%;margin-top:6px">';
+        $o .= '<button type="submit">发送</button>';
+        $o .= '<button type="button" class="cmt-cancel-btn" onclick="hideReplyForm(\''.htmlspecialchars($pid).'\')">取消</button>';
+        $o .= '</div>';
+        $o .= '</form>';
+        $o .= '<div class="cmt-emoji-panel" id="reply-emoji-panel-'.htmlspecialchars($pid).'" style="display:none" onclick="insertEmoji(event,this,\'reply-text-'.htmlspecialchars($pid).'\')"></div>';
+        $o .= '</div>';
+    }
+
+    if ($collapsed) $o .= '</div>'; // .cmt-body
+    $o .= '</div>'; // .cmt-section
+    $o .= '</div>'; // .ncs.pc
+    return $o;
+}
+?><!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title><?php echo htmlspecialchars($st); ?></title>
+<?php $_need_leaflet = ($pg === 'places' && ($C['show_places'] ?? 1)) || ($pg === 'home' && ($C['show_loc'] ?? 1) && (is_numeric(($C['loc1_lat'] ?? '')) || is_numeric(($C['loc2_lat'] ?? '')))); ?>
+<?php if ($_need_leaflet): ?>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<?php endif; ?>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23e07a5f'%3E%3Cpath d='M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z'/%3E%3C/svg%3E">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--pri:#d4786e;--pl:#f0b4ac;--ac:#c7a98c;--tx:#5a4e4a;--tl:#8c7e78;--bg:#f4f4f8;--card:#fff;--soft:#f5f5f5;--input:#f7f7f7;--prisoft:rgba(212,120,110,.08);--line:rgba(0,0,0,.06);--line2:rgba(0,0,0,.04);--ok:#e8f5e9;--oktx:#2e7d32;--err:#ffebee;--errtx:#c62828;--r:18px;--rs:12px;--rx:8px}
+[data-theme="dark"]{--pri:#ec9d94;--pl:#b5736c;--ac:#c0a387;--tx:#ece5df;--tl:#a89a92;--bg:#1f1b18;--card:#2b2522;--soft:#332c28;--input:#362e2a;--prisoft:rgba(236,157,148,.12);--line:rgba(255,255,255,.08);--line2:rgba(255,255,255,.05);--ok:#1e3a28;--oktx:#8fd6a8;--err:#45272b;--errtx:#ee8d9b}
+body{font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;overflow-x:hidden;line-height:1.6}
+[data-theme="dark"] body{background-blend-mode:multiply}
+.main-container{max-width:520px;margin:0 auto;padding:16px 16px 28px;position:relative;z-index:1}
+.nc{background:linear-gradient(var(--card),var(--card)) padding-box,linear-gradient(135deg,#ffc7d8,#ff8eae) border-box;border:1px solid transparent;border-radius:var(--r);box-shadow:0 2px 12px rgba(0,0,0,0.06);padding:24px;margin-bottom:16px}
+.ncs{padding:16px;background:linear-gradient(var(--card),var(--card)) padding-box,linear-gradient(135deg,#ffc7d8,#ff8eae) border-box;border:1px solid transparent;border-radius:var(--rs);box-shadow:0 1px 8px rgba(0,0,0,0.04);margin-bottom:12px}
+.hero{text-align:center;padding:30px 0 20px}
+.avd{display:flex;justify-content:center;align-items:center;gap:12px;margin-bottom:16px}
+.avd .av{width:70px;height:70px;border-radius:50%;box-shadow:0 2px 12px rgba(0,0,0,0.1);display:flex;align-items:center;justify-content:center;font-size:2em;background:linear-gradient(var(--card),var(--card)) padding-box,linear-gradient(135deg,#ffc7d8,#ff8eae) border-box;border:2px solid transparent;overflow:hidden;transition:transform .2s}
+.avd .av:hover{transform:scale(1.08)}
+.avd .hi{display:flex;align-items:center;justify-content:center;animation:heartbeat 1.6s ease-in-out infinite;filter:drop-shadow(0 2px 6px rgba(255,94,138,.35))}
+.avd .hi svg{display:block}
+@keyframes heartbeat{0%,42%,100%{transform:scale(1)}8%{transform:scale(1.18)}16%{transform:scale(.97)}24%{transform:scale(1.1)}32%{transform:scale(1)}}
+.hero h1{font-size:1.5em;font-weight:800;letter-spacing:2px;background:linear-gradient(135deg,#ffc7d8,#ff5e8a);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:4px}
+.hero .sub{font-size:.85em;color:var(--tl);letter-spacing:1px;display:flex;align-items:center;justify-content:center;flex-wrap:wrap;gap:6px}
+.hero .sub .vtag{display:inline-flex;align-items:center;gap:3px;padding:3px 9px;border-radius:999px;background:linear-gradient(135deg,#ffe3ea,#ffd0dc);border:1px solid rgba(255,94,138,.28);color:#ff5e8a;font-size:.76em;font-weight:600;letter-spacing:.4px;white-space:nowrap;box-shadow:0 1px 4px rgba(255,94,138,.15)}
+.hero .sub .nm{font-weight:800;background:linear-gradient(135deg,#ff8eae,#ff5e8a);-webkit-background-clip:text;-webkit-text-fill-color:transparent;letter-spacing:.5px}
+.hero .sub .spk{display:inline-flex;color:#ff8eae;flex-shrink:0}
+.hero .sub .spk svg{width:13px;height:13px;display:block;animation:spk 2.2s ease-in-out infinite}
+@keyframes spk{0%,100%{transform:scale(1) rotate(0deg);opacity:.8}50%{transform:scale(1.2) rotate(45deg);opacity:1}}
+.tc{text-align:center;position:relative;overflow:hidden;z-index:0;padding:18px 20px 14px}
+.tc::before{content:'';position:absolute;left:0;right:0;top:0;height:70px;background:radial-gradient(circle at 50% 0%,rgba(255,199,216,.45),transparent 70%);pointer-events:none;z-index:-1}
+.tc .tl{display:block;text-align:center;color:#ff5e8a;font-size:1em;font-weight:700;letter-spacing:2px;margin-bottom:10px}
+.tc .tn{font-size:4em;font-weight:900;letter-spacing:4px;background:linear-gradient(180deg,#ff9eb5,#ff5e8a);-webkit-background-clip:text;-webkit-text-fill-color:transparent;line-height:1;margin:4px 0 2px;filter:drop-shadow(0 2px 10px rgba(255,94,138,.22))}
+.tc .td{font-size:.9em;color:#e0728e;font-weight:600;margin-top:4px;letter-spacing:1px}
+.tc .tdt{font-size:.76em;color:#d98ba2;margin-top:6px;padding-top:6px;border-top:1px dashed rgba(255,94,138,.25)}
+.sr{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.ss{text-align:center;padding:14px 8px}
+.ss .n{font-size:1.5em;font-weight:800;color:#ff5e8a;line-height:1;margin-bottom:4px}
+.ss .l{font-size:.7em;color:var(--tl);letter-spacing:1px}
+.bn{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--card);border-radius:26px;box-shadow:0 4px 20px rgba(0,0,0,0.1),0 2px 6px rgba(0,0,0,0.04);display:flex;padding:6px 10px;z-index:100;gap:0;overflow-x:auto;max-width:95vw}
+.bn a{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:7px 13px;border-radius:20px;text-decoration:none;color:var(--tl);transition:all .2s;min-width:50px;font-weight:500;flex-shrink:0}
+.bn a .ni{font-size:1.35em;line-height:1;margin-bottom:2px}
+.bn a .nl{font-size:.6em}
+.bn a.active{color:#e85d5d;font-weight:700}
+.bn a:active{transform:scale(.94)}
+@media(min-width:600px){.bn a{padding:9px 18px}}
+.sh{display:flex;align-items:center;gap:10px;margin-bottom:14px}
+.sh .si{font-size:1.3em}
+.sh .st{font-size:1.05em;font-weight:700;color:var(--tx);letter-spacing:1px}
+.sh .sl{flex:1;height:2px;border-radius:2px;background:linear-gradient(to right,var(--pl),transparent)}
+.sh .sc{font-size:.75em;color:var(--tl);background:var(--card);padding:3px 10px;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,0.06)}
+.pc{margin-bottom:12px}
+.pc .ph{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.pc .pa{width:40px;height:40px;border-radius:50%;box-shadow:0 1px 6px rgba(0,0,0,0.08);overflow:hidden;display:flex;align-items:center;justify-content:center;font-size:1.2em;background:var(--card);flex-shrink:0}
+.pc .pa img{width:100%;height:100%;object-fit:cover;border-radius:50%}
+.pc .pi .name{font-weight:700;font-size:.9em}
+.pc .pi .time{font-size:.72em;color:var(--tl)}
+.pc .pm{font-size:1.4em;margin-left:auto}
+.pc .pb{font-size:.93em;line-height:1.7;color:var(--tx);word-break:break-word;overflow-wrap:break-word}
+.pc .pb h1,.pc .pb h2,.pc .pb h3,.pc .pb h4{margin:.6em 0 .3em;line-height:1.35}
+.pc .pb h1{font-size:1.25em}.pc .pb h2{font-size:1.15em}.pc .pb h3{font-size:1.05em}.pc .pb h4{font-size:.98em}
+.pc .pb code{background:var(--soft);border-radius:5px;padding:1px 6px;font-size:.88em;font-family:ui-monospace,Consolas,'Courier New',monospace}
+.pc .pb pre{background:#2d2a27;color:#f0ece8;border-radius:10px;padding:12px 14px;overflow-x:auto;margin:.5em 0;line-height:1.55}
+.pc .pb pre code{background:none;color:inherit;padding:0;font-size:.85em}
+.pc .pb blockquote{margin:.5em 0;padding:8px 14px;border-left:3px solid var(--pri);background:rgba(212,120,110,.06);border-radius:0 8px 8px 0;color:var(--tl)}
+.pc .pb ul{margin:.4em 0;padding-left:1.4em}
+.pc .pb ul li{margin:.15em 0}
+.pc .pb a{color:var(--pri);word-break:break-all}
+.pc .ptitle{font-size:1.1em;font-weight:700;color:var(--pri);margin-bottom:8px}
+.pc .ptags{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+.pc .ptags .tag{font-size:.7em;color:var(--pri);background:rgba(212,120,110,.08);padding:3px 10px;border-radius:12px}
+.pc .pimgs{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:12px}
+.pc .pimgs.c2{grid-template-columns:repeat(2,1fr)}
+.pc .pimgs.c1{grid-template-columns:1fr}
+.pc .pimgs img{width:100%;aspect-ratio:1;object-fit:cover;border-radius:var(--rx);cursor:pointer;box-shadow:0 1px 4px rgba(0,0,0,0.08);transition:transform .2s}
+.pc .pimgs img:hover{transform:scale(1.03)}
+.read-more{margin-top:10px;text-align:center}.read-more a{display:inline-block;padding:6px 18px;border-radius:20px;background:var(--pri);color:#fff;text-decoration:none;font-size:.85em;font-weight:600;opacity:.9}.read-more a:hover{opacity:1}
+.pc .pvideo{margin-top:12px}
+.pc .pvideo video{width:100%;border-radius:var(--rx);box-shadow:0 1px 4px rgba(0,0,0,0.08);background:#000}
+.pc .pvideo.pvideo-ext{position:relative;overflow:hidden;border-radius:var(--rx);box-shadow:0 1px 4px rgba(0,0,0,0.08);background:#000;line-height:0}
+.pc .pvideo.pvideo-ext a{display:block;position:relative}
+.pc .pvideo.pvideo-ext img{width:100%;max-height:400px;object-fit:cover;opacity:.85}
+.pc .pvideo-play{position:absolute;left:50%;bottom:10px;transform:translateX(-50%);background:rgba(0,0,0,.62);color:#fff;font-size:.8em;padding:6px 14px;border-radius:16px;line-height:1.2;white-space:nowrap}
+.pc .pmusic{margin-top:12px}
+.pc .pmusic audio{width:100%;border-radius:var(--rx);box-shadow:0 1px 4px rgba(0,0,0,0.06)}
+/* Comments v2 — 头像+点赞模式 */
+.cmt-section{margin-top:8px;border-top:1px solid var(--line);padding-top:10px}
+.cmt-item{display:flex;gap:10px;padding:10px 0}
+.cmt-item+.cmt-item{border-top:1px solid var(--line)}
+.cmt-avatar{width:44px;height:44px;border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:1em;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+.cmt-main{flex:1;min-width:0;overflow-wrap:break-word}
+.cmt-top-row{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:3px}
+.cmt-name{font-weight:700;font-size:.92em;color:var(--tx)}
+.cmt-reply-to{display:inline-block;font-size:.68em;color:var(--pri);background:var(--prisoft);padding:1px 8px;border-radius:9px;margin-left:4px;line-height:1.55;vertical-align:middle}
+.cmt-meta{font-size:.72em;color:var(--tl);line-height:1.4}
+.cmt-badge{display:inline-block;font-size:.6em;padding:1px 6px;border-radius:8px;vertical-align:middle;font-weight:400}
+.cmt-badge.admin{background:var(--pri);color:#fff}
+.cmt-badge.guest{background:#aaa;color:#fff}
+.cmt-text{font-size:.88em;color:var(--tx);line-height:1.5;word-break:break-all;overflow-wrap:break-word;margin-bottom:4px;overflow-x:hidden}
+.cmt-actions{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-top:2px}
+.cmt-like-actions{margin-left:auto;display:flex;align-items:center;gap:6px}
+.cmt-like-btn{cursor:pointer;font-size:.78em;filter:grayscale(1);opacity:.55;user-select:none;transition:filter .2s,opacity .2s;display:inline-flex;align-items:center;gap:2px}
+.cmt-like-btn:hover{opacity:.75}
+.cmt-like-btn.like-heart.liked{filter:none;opacity:1}
+.cmt-like-btn.dislike-heart.liked{filter:none;opacity:1}
+.cmt-like-num{font-size:.9em}
+.cmt-reply-btn{cursor:pointer;font-size:.78em;color:var(--tl);user-select:none;transition:opacity .15s}
+.cmt-reply-btn:hover{opacity:.7}
+.cmt-action-btn{cursor:pointer;font-size:.72em;color:var(--tl);user-select:none;margin-left:8px;padding:2px 6px;border-radius:4px;transition:all .15s}
+.cmt-action-btn:hover{opacity:.7}
+.cmt-del-btn{color:var(--errtx)}
+.cmt-del-btn:hover{background:var(--err)}
+.cmt-edit-form{margin:4px 0 4px 54px}
+.cmt-expand-btn{cursor:pointer;font-size:.78em;color:var(--pri);padding:4px 0 4px 54px;user-select:none}
+.cmt-replies-inline{padding-left:54px}
+.cmt-show-more{cursor:pointer;text-align:center;font-size:.8em;color:var(--pri);padding:8px 0;user-select:none;border-top:1px solid var(--line);margin-top:4px}
+.cmt-input-bar{display:flex;align-items:center;gap:8px;padding-top:10px;margin-top:10px;border-top:1px solid var(--line)}
+.cmt-avatar-mini{width:30px;height:30px;border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:.8em;overflow:hidden}
+.cmt-inline-form{flex:1;display:flex;gap:6px;min-width:0}
+.cmt-inline-input{flex:1;padding:7px 12px;border:1px solid rgba(0,0,0,.1);border-radius:18px;font-size:.82em;outline:none;background:var(--input);font-family:inherit;min-width:0}
+.cmt-inline-input:focus{background:var(--card);border-color:var(--pl)}
+.cmt-inline-send{padding:7px 14px;background:var(--pri);color:#fff;border:none;border-radius:18px;font-size:.78em;cursor:pointer;flex-shrink:0;white-space:nowrap}
+.cmt-login-bar{text-align:center;font-size:.82em;color:var(--tl);padding:10px 0;width:100%}
+.cmt-login-bar a{color:var(--pri);font-weight:500}
+/* 回复框 */
+.cmt-reply-form{margin-top:8px;padding-left:54px}
+.cmt-form{display:flex;flex-wrap:wrap;gap:6px}
+.cmt-form textarea{width:100%;padding:8px 12px;border:1px solid rgba(0,0,0,.1);border-radius:12px;font-size:.82em;outline:none;resize:vertical;min-height:36px;font-family:inherit}
+.cmt-form button{padding:8px 18px;background:var(--pri);color:#fff;border:none;border-radius:12px;font-size:.82em;cursor:pointer;transition:opacity .2s;white-space:nowrap}
+.cmt-form button:hover{opacity:.85}
+.cmt-cancel-btn{padding:8px 14px;background:var(--soft);color:var(--tl);border:none;border-radius:12px;font-size:.82em;cursor:pointer}
+/* 管理员回复 */
+.cmt-admin-reply{margin:6px 0 6px 54px;background:var(--prisoft);border:1px solid var(--pl);border-radius:10px;padding:10px 14px;border-left:4px solid var(--pri)}
+.cmt-admin-reply-header{font-size:.75em;font-weight:700;color:var(--pri);margin-bottom:4px}
+.cmt-admin-reply-text{font-size:.82em;color:var(--tx);line-height:1.5}
+.cmt-toggle{text-align:center;font-size:.86em;color:var(--pri);padding:5px 0;cursor:pointer;user-select:none;transition:opacity .15s}
+.cmt-toggle:hover{opacity:.7}
+.cmt-toggle.expanded{color:var(--tl);font-size:.78em;padding:3px 0}
+.cmt-msg{padding:8px 12px;border-radius:8px;margin-bottom:8px;font-size:.8em}
+.cmt-msg.ok{background:var(--ok);color:var(--oktx)}
+.cmt-msg.err{background:var(--err);color:var(--errtx)}
+.ag{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+.ai{border-radius:var(--rs);overflow:hidden;cursor:pointer;box-shadow:0 1px 6px rgba(0,0,0,0.06);aspect-ratio:1;position:relative;transition:transform .2s}
+.ai:hover{transform:translateY(-2px)}
+.ai img{width:100%;height:100%;object-fit:cover}
+.ai .cap{position:absolute;bottom:0;left:0;right:0;padding:8px 12px;background:linear-gradient(transparent,rgba(0,0,0,0.5));color:#fff;font-size:.78em;font-weight:600}
+.plc{display:flex;gap:14px;align-items:flex-start}
+.plc .pimg{width:70px;height:70px;border-radius:var(--rs);box-shadow:0 1px 6px rgba(0,0,0,0.06);object-fit:cover;flex-shrink:0;background:var(--card);display:flex;align-items:center;justify-content:center;font-size:2em}
+.plc .pimg.ni{box-shadow:inset 0 1px 4px rgba(0,0,0,0.06)}
+.plc .pin{flex:1}
+.plc .pn{font-weight:700;font-size:.95em;margin-bottom:2px}
+.plc .pd{font-size:.72em;color:var(--tl);margin-bottom:4px}
+.plc .pnote{font-size:.82em;color:var(--tl);line-height:1.5}
+.ti{display:flex;align-items:center;gap:12px;padding:14px 0;border-bottom:1px solid var(--line)}
+.ti:last-child{border-bottom:none}
+.tc2{width:38px;height:38px;border-radius:50%;box-shadow:0 1px 6px rgba(0,0,0,0.08);display:flex;align-items:center;justify-content:center;font-size:1.2em;flex-shrink:0;cursor:pointer}
+.tc2.done{box-shadow:inset 0 1px 4px rgba(0,0,0,0.08);color:var(--pri)}
+.tcnt{flex:1}
+.tcnt .tt{font-weight:600;font-size:.93em}
+.tcnt .tt.dt{text-decoration:line-through;color:var(--tl)}
+.tcnt .tm{font-size:.7em;color:var(--tl);margin-top:2px}
+.tcnt .tnote{font-size:.8em;color:var(--tl)}
+.empty{text-align:center;padding:40px 20px;color:var(--tl)}
+.empty .ei{font-size:3em;margin-bottom:10px;opacity:.6}
+.empty .et{font-size:.9em}
+.pr{display:flex;align-items:center;justify-content:space-between;padding:14px 18px;cursor:pointer;text-decoration:none;color:var(--tx)}
+.pr .pl{display:flex;align-items:center;gap:10px}
+.pr .pv{font-size:1.3em}
+.pr .pt{font-weight:600;font-size:.93em}
+.pr .pc2{font-size:.78em;color:var(--tl);background:var(--soft);padding:2px 10px;border-radius:10px}
+.pr .ar{color:var(--tl);font-size:.9em}
+.lb{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.92);z-index:9999;align-items:center;justify-content:center;cursor:pointer}
+.lb.show{display:flex}
+.lb img{max-width:92vw;max-height:85vh;border-radius:8px}
+.lb .lcl{position:absolute;top:20px;right:24px;color:#fff;font-size:2em;cursor:pointer;width:44px;height:44px;display:flex;align-items:center;justify-content:center;border-radius:50%;background:rgba(255,255,255,0.1)}
+.pts{position:fixed;inset:0;pointer-events:none;z-index:0}
+.pt{position:absolute;animation:floatUp 5s ease-in infinite;opacity:0}
+@keyframes floatUp{0%{transform:translateY(105vh)scale(0);opacity:0}10%{opacity:.5}90%{opacity:.15}100%{transform:translateY(-5vh)scale(1.2);opacity:0}}
+.ft{text-align:center;padding:20px 12px 100px;color:var(--tl);font-size:.7em;line-height:1.8}
+.ft a{color:var(--tl);text-decoration:none;border-bottom:1px dashed var(--line)}
+.ft a:hover{color:var(--pri);border-bottom-color:var(--pri)}
+/* 纪念日滑动条（内嵌于计时卡片） */
+.tc .acm-scroll{display:flex;gap:8px;overflow-x:auto;scroll-snap-type:x mandatory;-webkit-overflow-scrolling:touch;padding:1px 1px 5px;scrollbar-width:none}
+.tc .acm-scroll::-webkit-scrollbar{display:none}
+.acm-item{flex-shrink:0;scroll-snap-align:center;min-width:108px;border-radius:13px;padding:10px 10px 9px;background:rgba(255,255,255,.6);border:1px solid rgba(255,94,138,.14);text-align:center;box-shadow:0 1px 4px rgba(255,94,138,.07)}
+[data-theme="dark"] .acm-item{background:rgba(255,255,255,.05);border-color:rgba(255,94,138,.2)}
+.acm-item.done{opacity:.62;border-style:dashed;background:rgba(255,255,255,.32)}
+[data-theme="dark"] .acm-item.done{background:rgba(255,255,255,.03)}
+.acm-item.next{background:linear-gradient(135deg,#ff9eb5,#ff5e8a);border-color:transparent;box-shadow:0 3px 12px rgba(255,94,138,.35)}
+.acm-t{font-size:.92em;font-weight:800;color:#d45976;white-space:nowrap}
+.acm-item.next .acm-t{color:#fff}
+.acm-item.done .acm-t{color:#c08b98}
+.acm-d{font-size:.62em;color:#d98ba2;margin-top:4px;letter-spacing:.4px}
+.acm-item.next .acm-d{color:rgba(255,255,255,.85)}
+.acm-item.done .acm-d{color:#c9a0ab}
+.acm-r{font-size:.6em;margin-top:7px;color:#e0728e;font-weight:700;white-space:nowrap}
+.acm-item.next .acm-r{color:#fff;background:rgba(255,255,255,.26);border-radius:16px;display:inline-block;padding:2px 9px}
+.acm-item.done .acm-r{color:#c9a0ab}
+.acm-item.wait .acm-r{color:#e0b3c0}
+.tc .av-foot{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:13px;padding-top:10px;border-top:1px dashed rgba(255,94,138,.2);font-size:.62em;color:#d98ba2;font-weight:600;letter-spacing:.3px}
+.tc .av-foot b{color:#ff5e8a;font-weight:800}
+.tc .anniv-tab{position:absolute;top:10px;right:12px;display:inline-flex;align-items:center;gap:4px;padding:4px 10px;border-radius:999px;border:1px solid rgba(255,94,138,.28);background:linear-gradient(135deg,#ffe3ea,#ffd0dc);color:#ff5e8a;font-size:.68em;font-weight:700;letter-spacing:1px;cursor:pointer;box-shadow:0 1px 4px rgba(255,94,138,.16);z-index:2;line-height:1.4}
+.tc .anniv-tab:active{transform:scale(.96)}
+.tc .anniv-tab.lc{right:auto;left:12px}
+.tc #viewLoc{display:none;text-align:center;min-height:168px;flex-direction:column;box-sizing:border-box;justify-content:center}
+.tc.show-loc #viewTimer{display:none}
+.tc.show-loc #viewLoc{display:flex}
+.tc .loc-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:#d98ba2;font-size:.8em;min-height:168px}
+.tc .loc-empty .lb{color:#ff5e8a;font-size:.92em;font-weight:800;letter-spacing:1px}
+.tc #locMapWrap{width:100%;height:240px;border-radius:12px;overflow:hidden;margin:0 0 8px;border:1px solid rgba(255,94,138,.18);box-shadow:0 2px 8px rgba(255,94,138,.1);position:relative;z-index:1}
+.tc #locMap{width:100%;height:100%;background:#fdf6f8}
+.tc .loc-st{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:.62em;color:#d98ba2;font-weight:600;letter-spacing:.2px;padding-top:6px;border-top:1px dashed rgba(255,94,138,.2)}
+.tc .loc-st b{color:#ff5e8a;font-weight:800}
+.tc .loc-dist{display:none;text-align:center;color:#e0728e;font-size:.68em;font-weight:700;letter-spacing:.5px;margin-bottom:8px}
+.locmk .mh{width:34px;height:34px;border-radius:50%;border:3px solid #fff;box-shadow:0 1px 6px rgba(0,0,0,.35);overflow:hidden;position:relative;background:#ff5e8a;display:flex;align-items:center;justify-content:center;box-sizing:border-box}
+.locmk.blue .mh{background:#5c9ce6}
+.locmk .mh .ah{width:100%;height:100%;object-fit:cover;display:block}
+.locmk .mh .ch{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:800;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.2)}
+.locmk .lb{display:block;position:absolute;top:auto;bottom:-24px;left:50%;transform:translateX(-50%);width:max-content;font-size:11px;line-height:1.2;white-space:nowrap;background:rgba(255,255,255,.95);padding:3px 7px;border-radius:8px;color:#e0728e;font-weight:700;box-shadow:0 1px 4px rgba(0,0,0,.15);border:1px solid rgba(255,94,138,.15);z-index:5;font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif}
+.locmk.blue .lb{color:#4a7fc4;border-color:rgba(92,156,230,.2)}
+.tc #viewAnniv{display:none;text-align:left;min-height:168px;flex-direction:column;justify-content:center;box-sizing:border-box}
+.tc.show-anniv #viewTimer{display:none}
+.tc.show-anniv #viewAnniv{display:flex}
+.tc.show-anniv .acm-scroll{width:100%;padding:2px 0 4px}
+.tc .av-tt{display:flex;align-items:center;justify-content:center;gap:6px;font-size:.8em;color:#ff5e8a;font-weight:700;letter-spacing:1px;padding:2px 0 10px}
+@media(min-width:600px){.main-container{padding:24px 24px 28px}.ag{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:480px){.cmt-reply-form{padding-left:0}.cmt-replies-inline{padding-left:0}.cmt-expand-btn{padding-left:0}.cmt-admin-reply{margin-left:0}.cmt-expand-replies{padding-left:0}.cmt-expand-replies-hidden{padding-left:0}.cmt-edit-form{margin-left:0}}
+.bn a[href="?p=home"] .ni{color:#e85d5d}
+.bn a[href="?p=posts"] .ni{color:#5c9ce6}
+.bn a[href="?p=album"] .ni{color:#4da6ff}
+.bn a[href="?p=places"] .ni{color:#e8553d}
+.bn a[href="?p=todos"] .ni{color:#5cb85c}
+.bn a.active[href="?p=home"] .ni{color:#e85d5d}
+.bn a.active[href="?p=posts"] .ni{color:#4a8ed4}
+.bn a.active[href="?p=album"] .ni{color:#3a94e8}
+.bn a.active[href="?p=places"] .ni{color:#d44a33}
+.bn a.active[href="?p=todos"] .ni{color:#4aaa4e}
+.cp-content{font-size:.93em;line-height:1.8;color:var(--tx);word-break:break-word}
+.cp-content img{max-width:100%;border-radius:8px;margin:8px 0}
+.cp-content h3,.cp-content h4{color:var(--pri);margin:16px 0 8px}
+.cp-content p{margin:0 0 12px}
+/* 头像可点击 */
+.cmt-avatar-link{text-decoration:none;display:inline-flex;max-width:100%}
+/* 评论图片 */
+.cmt-image{margin:4px 0 2px}
+.cmt-image img{max-width:100%;max-height:300px;border-radius:8px;cursor:pointer;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+/* 输入框工具条 */
+.cmt-input-wrap{display:flex;align-items:center;gap:4px;flex:1;min-width:0}
+.cmt-inline-input{flex:1;min-width:0}
+.cmt-input-tools{display:flex;gap:2px;flex-shrink:0}
+.cmt-tool-btn{display:inline-flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:50%;cursor:pointer;font-size:1.1em;transition:all .15s;user-select:none}
+.cmt-tool-btn:hover{background:var(--pl);transform:scale(1.1)}
+.cmt-img-btn{font-size:1em}
+/* 表情面板 */
+.cmt-emoji-panel{position:absolute;bottom:100%;left:0;background:var(--card);border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.12);padding:8px;display:grid;grid-template-columns:repeat(8,1fr);gap:4px;z-index:100;max-height:200px;overflow-y:auto;margin-bottom:4px;border:1px solid var(--line);max-width:calc(100vw - 40px)}
+.cmt-emoji-panel span{display:flex;align-items:center;justify-content:center;width:32px;max-width:100%;aspect-ratio:1;cursor:pointer;border-radius:6px;font-size:1.2em;transition:background .1s}
+.cmt-emoji-panel span:hover{background:var(--pl)}
+.cmt-input-bar{position:relative}
+.cmt-reply-form{position:relative}
+/* 赞赏 */
+.reward-btn{display:inline-block;padding:9px 26px;border:none;border-radius:24px;font-size:.92em;font-weight:700;cursor:pointer;color:#fff;background:linear-gradient(135deg,#ff8a80,#ff6b6b);box-shadow:0 4px 14px rgba(255,107,107,.35);transition:transform .15s}
+.reward-btn:active{transform:scale(.94)}
+.reward-mask{position:fixed;inset:0;z-index:400;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;opacity:0;visibility:hidden;transition:opacity .2s,visibility .2s}
+.reward-mask.show{opacity:1;visibility:visible}
+.reward-modal{background:linear-gradient(var(--card),var(--card)) padding-box,linear-gradient(135deg,#ffc7d8,#ff8eae) border-box;border:1px solid transparent;border-radius:16px;width:min(88vw,320px);padding:20px 18px 16px;box-shadow:0 12px 40px rgba(0,0,0,.25);text-align:center;max-height:90vh;overflow-y:auto}
+.reward-head{font-size:1.05em;font-weight:700;color:var(--tx);margin-bottom:12px}
+.reward-tabs{display:flex;gap:8px;justify-content:center;margin-bottom:14px}
+.rtab{padding:7px 18px;border:1px solid var(--line);border-radius:18px;background:transparent;color:var(--tl);font-size:.85em;cursor:pointer;transition:all .15s}
+.rtab.active{color:#fff;border-color:transparent}
+.rtab.active#rtab-wx{background:#07c160}
+.rtab.active#rtab-ali{background:#1677ff}
+.reward-qr{width:min(62vw,210px);height:auto;border-radius:10px;border:1px solid var(--line);background:#fff}
+.reward-tip{font-size:.78em;color:var(--tl);margin-top:8px}
+.reward-empty{font-size:.85em;color:var(--tl);padding:30px 0}
+.reward-close{margin-top:14px;padding:7px 26px;border:1px solid var(--line);border-radius:18px;background:transparent;color:var(--tl);font-size:.83em;cursor:pointer}
+.reward-close:active{transform:scale(.95)}
+
+/* ---- UI 精修（图标/布局增强） ---- */
+svg.ico{vertical-align:-.12em;display:inline-block;flex:none}
+.sh{display:flex;align-items:center;gap:8px}
+.sh .si{display:inline-flex;align-items:center;justify-content:center;color:var(--pri);flex:none}
+.sh .st{font-weight:700;color:var(--tx)}
+.nav-a,.nav-b,.nav-c{display:inline-flex;align-items:center;gap:6px}
+.ni{display:inline-flex;align-items:center;justify-content:center}
+.l{display:flex;align-items:center;gap:8px}
+.l .l-ico{display:inline-flex;color:var(--pri)}
+.lk a{display:flex;align-items:center;gap:8px}
+.lk-ico{display:inline-flex;color:var(--pri)}
+.cmt-like-actions{display:inline-flex;align-items:center;gap:6px;margin-left:auto}
+.cmt-like-btn{display:inline-flex;align-items:center;gap:4px;cursor:pointer;color:var(--tl);transition:transform .15s ease,color .15s ease;user-select:none}
+.cmt-like-btn.like-heart{color:var(--tl)}
+.cmt-like-btn.like-heart.liked{color:#e04f5f;transform:scale(1.08)}
+.cmt-like-btn.like-heart.liked svg{fill:#e04f5f;stroke:#e04f5f}
+.cmt-like-btn.dislike-heart.liked{color:#8b9dc3}
+.cmt-like-btn.dislike-heart.liked svg{fill:#8b9dc3;stroke:#8b9dc3}
+.cmt-tool-btn{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:8px;cursor:pointer;color:var(--tl);transition:background .15s,color .15s}
+.cmt-tool-btn:hover{background:rgba(128,128,128,.12);color:var(--pri)}
+.cmt-toggle{display:flex;align-items:center;justify-content:center;gap:6px;width:100%;cursor:pointer;font-size:.86em;color:var(--tl);margin:4px 0 2px;padding:4px 0}
+.cmt-toggle:hover{color:var(--pri)}
+.reward-head{display:flex;align-items:center;justify-content:center;gap:8px;font-size:1.05em;font-weight:700}
+.reward-btn{display:inline-flex;align-items:center;gap:7px}
+.btn,.btn2{display:inline-flex;align-items:center;gap:6px}
+.post-card .pmeta{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.hero .hi{line-height:1;color:#ff5e8a}
+.pm{display:flex;align-items:center;gap:4px}
+.empty .ei{display:inline-flex;color:var(--tl);opacity:.55;line-height:1}
+.ncs.empty{display:flex;flex-direction:column;align-items:center;gap:12px}
+
+
+.ico{display:inline-block;vertical-align:-3px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.lbl-ico{display:inline-flex;align-items:center;vertical-align:-2px;color:var(--pri,#4a90d9);margin-right:5px;gap:3px}
+.ico-badge{display:inline-block;vertical-align:-5px;margin-right:8px;color:var(--pri,#4a90d9)}
+.btn .ico,a .ico,.lbl-ico .ico{pointer-events:none}
+
+.cmt-toggle .ct-ic{display:inline-flex;vertical-align:-2px;margin-right:2px}
+.cmt-toggle .ct-ic svg{display:block}
+.cmt-toggle .ct-tx{vertical-align:middle}
+</style>
+</head>
+<body<?php if(!empty($C['background_image'])): ?> style="background-image:url('<?php echo htmlspecialchars($C['background_image']); ?>');background-size:cover;background-position:center;background-attachment:fixed;"<?php endif; ?>>
+<button id="themeToggle" onclick="toggleTheme()" title="切换奶白/黑夜模式" style="position:fixed;top:14px;right:14px;z-index:300;width:34px;height:34px;border-radius:50%;border:none;cursor:pointer;background:var(--card);box-shadow:0 2px 8px rgba(0,0,0,.12);font-size:1.05em;display:flex;align-items:center;justify-content:center;transition:transform .2s"><?php echo m_ico('moon',17); ?></button>
+<div class="pts" id="pcs"></div>
+<div class="main-container">
+
+<div class="hero">
+<div class="avd">
+<div class="av"><?php echo AV($a1, '👦'); ?></div>
+<div class="hi"><svg viewBox="0 0 24 24" width="30" height="30" aria-hidden="true"><defs><linearGradient id="avdHg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffd9e4"/><stop offset="1" stop-color="#ff5e8a"/></linearGradient></defs><path fill="url(#avdHg)" d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/><ellipse cx="8.3" cy="7.2" rx="2.2" ry="1.4" fill="#fff" opacity=".4" transform="rotate(-30 8.3 7.2)"/></svg></div>
+<div class="av"><?php echo AV($a2, '👧'); ?></div>
+</div>
+<h1><?php echo htmlspecialchars($st); ?></h1>
+<div class="sub"><span class="spk"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0c.8 6.3 5.7 11.2 12 12-6.3.8-11.2 5.7-12 12-.8-6.3-5.7-11.2-12-12C6.3 11.2 11.2 6.3 12 0z"/></svg></span><span class="nm"><?php echo htmlspecialchars($n1); ?></span><span class="vtag">唯一认证.中国</span><span class="nm"><?php echo htmlspecialchars($n2); ?></span><span class="spk"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0c.8 6.3 5.7 11.2 12 12-6.3.8-11.2 5.7-12 12-.8-6.3-5.7-11.2-12-12C6.3 11.2 11.2 6.3 12 0z"/></svg></span></div>
+<?php
+echo '<div class="yiyan-box" id="yiyan-box" style="text-align:center;padding:0 0 8px">';
+echo '<div class="yiyan-text" id="yiyan-text" style="font-size:.82em;color:var(--tl);font-style:italic;line-height:1.5;min-height:1.2em"></div>';
+echo '<div class="yiyan-author" id="yiyan-author" style="font-size:.7em;color:var(--tl);margin-top:2px;opacity:.6"></div>';
+echo '</div>';
+?>
+<script>
+(function(){
+var apiUrl = <?php
+$ycf = [];
+if (file_exists(__DIR__ . '/data/yiyan_config.json')) {
+    $ycf = json_decode(file_get_contents(__DIR__ . '/data/yiyan_config.json'), true) ?: [];
+}
+echo json_encode($ycf['api_url'] ?? '/api.php');
+?>;
+fetch(apiUrl)
+  .then(function(r){return r.text()})
+  .then(function(txt){
+    txt = (txt||'').trim();
+    if(!txt) return;
+    var t='', a='', s='';
+    try {
+      var d = JSON.parse(txt);
+      if (d && d.code===1 && d.data) {
+        t = d.data.text||''; a = d.data.author||''; s = d.data.source||'';
+      } else if (d && (d.hitokoto||d.text||d.content)) {
+        t = d.hitokoto||d.text||d.content||'';
+        a = d.from_who||d.author||'';
+        s = d.from||d.source||'';
+      } else {
+        t = txt;
+      }
+    } catch(e) {
+      t = txt;
+    }
+    if(t){
+      document.getElementById('yiyan-text').textContent='\u201C'+t+'\u201D';
+      document.getElementById('yiyan-author').textContent=(a?'\u2014\u2014 '+a:'')+(s?' ['+s+']':'');
+    }
+  })
+  .catch(function(){});
+})();
+</script>
+<script>
+function openReward(){var m=document.getElementById('rewardMask');if(m)m.classList.add('show')}
+function closeReward(){var m=document.getElementById('rewardMask');if(m)m.classList.remove('show')}
+function switchReward(k){
+  var showWx = (k==='wx');
+  var bw=document.getElementById('rbody-wx'), ba=document.getElementById('rbody-ali');
+  var tw=document.getElementById('rtab-wx'), ta=document.getElementById('rtab-ali');
+  if(!bw||!ba) return;
+  bw.style.display=showWx?'':'none'; ba.style.display=showWx?'none':'';
+  if(tw)tw.className=showWx?'rtab active':'rtab';
+  if(ta)ta.className=showWx?'rtab':'rtab active';
+}
+</script>
+
+
+</div>
+
+<?php if ($commentMsg): ?><div class="cmt-msg ok"><?php echo m_ico('check',15); ?> <?php echo htmlspecialchars($commentMsg); ?></div><?php endif; ?>
+<?php if ($commentErr): ?><div class="cmt-msg err"><?php echo m_ico('alert',15); ?> <?php echo htmlspecialchars($commentErr); ?></div><?php endif; ?>
+
+<?php if ($pg === 'home'): ?>
+<?php $_showAnniv = (bool)($C['show_anniv'] ?? 1); $_showLoc = (bool)($C['show_loc'] ?? 1); ?>
+<div class="nc tc" id="tcCard">
+<?php if ($_showAnniv): ?><button type="button" class="anniv-tab" id="annivTab"><span id="annivTabIco">♡</span><span id="annivTabTx">纪念日</span></button><?php endif; ?>
+<?php if ($_showLoc): ?><button type="button" class="anniv-tab lc" id="locTab"><?php echo m_ico('place',12); ?><span id="locTabTx">位置</span></button><?php endif; ?>
+<div id="viewTimer">
+<div class="tl"><?php echo htmlspecialchars($C['love_title'] ?? '已经在一起'); ?></div>
+<div class="tn" id="dc"><?php echo $ds; ?></div>
+<div class="td"><?php echo $y; ?>年 <?php echo $m; ?>个月 <?php echo $d; ?>天</div>
+<div class="tdt"><?php echo m_ico('calendar',13); ?> <?php echo date('Y/m/d', strtotime($ld)); ?> → ∞</div>
+</div>
+<?php
+// ===== 纪念日里程碑（基于 love_date 计算）=====
+$_ldStart = strtotime(date('Y-m-d', strtotime($ld)));
+$_today = strtotime(date('Y-m-d'));
+$_days = (int)(($_today - $_ldStart) / 86400);
+$_miles = [
+    ['n'=>100,   'label'=>'百日'],
+    ['n'=>365,   'label'=>'一周年'],
+    ['n'=>520,   'label'=>'520'],
+    ['n'=>666,   'label'=>'666'],
+    ['n'=>777,   'label'=>'777'],
+    ['n'=>888,   'label'=>'888'],
+    ['n'=>999,   'label'=>'999'],
+    ['n'=>1000,  'label'=>'千日'],
+    ['n'=>1314,  'label'=>'1314'],
+    ['n'=>1500,  'label'=>'1500天'],
+    ['n'=>2000,  'label'=>'2000天'],
+];
+$_nxIdx = null;
+foreach ($_miles as $_i => &$_mk) {
+    $_mk['date'] = date('Y/m/d', $_ldStart + $_mk['n'] * 86400);
+    $_mk['left'] = $_mk['n'] - $_days;
+    if ($_nxIdx === null && $_mk['n'] > $_days) { $_nxIdx = $_i; }
+}
+unset($_mk);
+?>
+<?php if ($_showAnniv): ?>
+<div id="viewAnniv">
+<div class="av-tt"><?php echo m_ico('heart',12); ?><span>纪念日时间表</span></div>
+<div class="acm-scroll" id="acmScroll">
+<?php foreach ($_miles as $_i => $_mk):
+    $_cls = ($_nxIdx !== null && $_i === $_nxIdx) ? 'next' : ($_mk['n'] <= $_days ? 'done' : 'wait'); ?>
+<div class="acm-item <?php echo $_cls; ?>"<?php echo $_i === $_nxIdx ? ' id="acmNow"' : ''; ?>>
+<div class="acm-t"><?php echo $_mk['n'] <= $_days ? '✓ ' : ''; ?><?php echo htmlspecialchars($_mk['label']); ?></div>
+<div class="acm-d"><?php echo $_mk['date']; ?></div>
+<div class="acm-r"><?php echo $_i === $_nxIdx ? ('还有 ' . max(0,$_mk['left']) . ' 天') : ($_mk['n'] <= $_days ? '已达成' : '· · ·'); ?></div>
+</div>
+<?php endforeach; ?>
+</div>
+<div class="av-foot"><span>已走过 <?php echo $_nxIdx === null ? count($_miles) : $_nxIdx; ?> 个纪念日</span><?php if ($_nxIdx !== null): ?><span>下一站 · <b><?php echo htmlspecialchars($_miles[$_nxIdx]['label']); ?></b> 还有 <?php echo max(0,$_miles[$_nxIdx]['left']); ?> 天</span><?php endif; ?></div>
+</div>
+<?php endif; ?>
+<?php if ($_showLoc): ?>
+<div id="viewLoc">
+<div class="loc-empty" id="locEmpty" style="display:none"><div class="lb">两人位置</div><div>后台还没有设置两人的位置</div></div>
+<div id="locMapWrap" style="display:none"><div id="locMap"></div></div>
+<div class="loc-dist" id="locDist"></div>
+<div class="loc-st" id="locSt" style="display:none"><span id="locStL"></span><span id="locStR"></span></div>
+</div>
+<?php endif; ?>
+</div>
+<script><?php
+$_loc_pts = [];
+if (is_numeric(($C['loc1_lat'] ?? '')) && is_numeric(($C['loc1_lng'] ?? ''))) {
+    $_loc_pts[] = ['lat'=>(float)$C['loc1_lat'], 'lng'=>(float)$C['loc1_lng'], 'name'=>(string)($C['name1'] ?? '我'), 'addr'=>(string)($C['loc1_addr'] ?? ''), 'avatar'=>(string)($C['avatar1'] ?? ''), 'c'=>'pink'];
+}
+if (is_numeric(($C['loc2_lat'] ?? '')) && is_numeric(($C['loc2_lng'] ?? ''))) {
+    $_loc_pts[] = ['lat'=>(float)$C['loc2_lat'], 'lng'=>(float)$C['loc2_lng'], 'name'=>(string)($C['name2'] ?? 'TA'), 'addr'=>(string)($C['loc2_addr'] ?? ''), 'avatar'=>(string)($C['avatar2'] ?? ''), 'c'=>'blue'];
+}
+?>(function(){
+var card=document.getElementById('tcCard'),tab=document.getElementById('annivTab'),
+    ico=document.getElementById('annivTabIco'),tx=document.getElementById('annivTabTx'),
+    ltab=document.getElementById('locTab'), ltx=document.getElementById('locTabTx'),
+    sc=document.getElementById('acmScroll'),now=document.getElementById('acmNow');
+var LOC=<?php echo json_encode($_loc_pts, JSON_UNESCAPED_UNICODE); ?>;
+function center(){if(now&&sc){try{sc.scrollLeft=Math.max(0,now.offsetLeft-sc.clientWidth/2+now.clientWidth/2);}catch(e){}}}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(m){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m];});}
+function distKm(a,b){var R=6371,r=Math.PI/180,d=(b.lat-a.lat)*r,e=(b.lng-a.lng)*r,s=Math.sin(d/2)*Math.sin(d/2)+Math.cos(a.lat*r)*Math.cos(b.lat*r)*Math.sin(e/2)*Math.sin(e/2);return Math.round(R*2*Math.atan2(Math.sqrt(s),Math.sqrt(1-s)));}
+function setMode(m){
+    var a=m==='anniv',l=m==='loc';
+    card.classList.toggle('show-anniv',a);
+    card.classList.toggle('show-loc',l);
+    if(ico)ico.textContent=a?'♥':'♡';
+    if(tx)tx.textContent=a?'返回计时':'纪念日';
+    if(ltx)ltx.textContent=l?'返回计时':'位置';
+    if(a)setTimeout(center,40);
+    if(l)setTimeout(showLoc,80);
+}
+if(tab)tab.addEventListener('click',function(){setMode(card.classList.contains('show-anniv')?'timer':'anniv');});
+if(ltab)ltab.addEventListener('click',function(){setMode(card.classList.contains('show-loc')?'timer':'loc');});
+function showLoc(){
+    var empty=document.getElementById('locEmpty'),wrap=document.getElementById('locMapWrap'),
+        st=document.getElementById('locSt'),dst=document.getElementById('locDist'),
+        stL=document.getElementById('locStL'),stR=document.getElementById('locStR');
+    if(!LOC.length){empty.style.display='flex';wrap.style.display='none';st.style.display='none';dst.style.display='none';return;}
+    empty.style.display='none';
+    wrap.style.display='block';
+    if(!window.__locMap){
+        var map=L.map(document.getElementById('locMap'),{zoomSnap:0.25});
+        L.tileLayer('https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}',{subdomains:['1','2','3','4'],maxZoom:18,attribution:''}).addTo(map);
+        LOC.forEach(function(p){
+            var ini=esc((p.name||'?').charAt(0)),city=esc(p.addr||p.name);
+            var inner=p.avatar
+                ? '<img class="ah" src="'+esc(p.avatar)+'" alt="" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'"><span class="ch" style="display:none">'+ini+'</span>'
+                : '<span class="ch">'+ini+'</span>';
+            var ic=L.divIcon({className:'locmk '+p.c,html:'<div class="mh">'+inner+'</div><span class="lb">'+city+'</span>',iconSize:[34,34],iconAnchor:[17,17]});
+            L.marker([p.lat,p.lng],{icon:ic,title:p.name}).addTo(map);
+        });
+        if(LOC.length===1){
+            map.setView([LOC[0].lat,LOC[0].lng],6);
+        }else if(distKm(LOC[0],LOC[1])>800){
+            map.setView([34,104],3.25);
+        }else{
+            map.fitBounds(LOC.map(function(p){return [p.lat,p.lng];}),{padding:[20,40],maxZoom:11});
+        }
+        window.__locMap=map;
+    }else{
+        setTimeout(function(){window.__locMap.invalidateSize();},80);
+    }
+    st.style.display='flex';
+    var a=LOC[0],b=LOC[1];
+    stL.textContent=a.name+(a.addr?(' · '+a.addr):'');
+    stR.textContent=b?b.name+(b.addr?(' · '+b.addr):''):'未设置位置';
+    if(b){dst.textContent='两地相距约 '+distKm(a,b)+' 公里';}
+    else{dst.textContent=a.addr?('我在 '+a.addr):(a.name?('我的位置 · '+a.name):'我的位置');}
+    dst.style.display='block';
+    setTimeout(function(){if(window.__locMap)window.__locMap.invalidateSize();},100);
+}
+})();</script>
+
+<div class="sr">
+<?php if ($C['show_comments'] ?? 1): ?><div class="ncs ss"><div class="n"><?php echo count($P); ?></div><div class="l"><span class="l-ico"><?php echo m_ico('comment',15); ?></span>说说</div></div><?php endif; ?>
+<?php if ($C['show_album'] ?? 1): ?><div class="ncs ss"><div class="n"><?php echo count($PH); ?></div><div class="l"><span class="l-ico"><?php echo m_ico('album',15); ?></span>相册</div></div><?php endif; ?>
+<?php if ($C['show_places'] ?? 1): ?><div class="ncs ss"><div class="n"><?php echo count($PL); ?></div><div class="l"><span class="l-ico"><?php echo m_ico('place',15); ?></span>足迹</div></div><?php endif; ?>
+<?php if ($C['show_todos'] ?? 1): ?><div class="ncs ss"><div class="n"><?php echo $DN.'/'.count($T); ?></div><div class="l"><span class="l-ico"><?php echo m_ico('todo',15); ?></span>清单</div></div><?php endif; ?>
+</div>
+
+<?php if ($C['show_comments'] ?? 1): ?><a href="?p=posts" style="display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-radius:12px;background:linear-gradient(var(--card),var(--card)) padding-box,linear-gradient(135deg,#ffc7d8,#ff8eae) border-box;border:1px solid transparent;box-shadow:0 1px 8px rgba(0,0,0,0.04);margin-bottom:10px;text-decoration:none;color:var(--tx);font-size:.93em;font-weight:600"><span style="display:flex;align-items:center;gap:10px"><span class="lk-ico"><?php echo m_ico('comment',20); ?></span><span>甜蜜说说</span></span><span style="font-size:.78em;color:var(--tl);background:var(--soft);padding:2px 10px;border-radius:10px"><?php echo count($P); ?>条</span><span class="ar">›</span></a><?php endif; ?>
+<?php if ($C['show_album'] ?? 1): ?><a href="?p=album" style="display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-radius:12px;background:linear-gradient(var(--card),var(--card)) padding-box,linear-gradient(135deg,#ffc7d8,#ff8eae) border-box;border:1px solid transparent;box-shadow:0 1px 8px rgba(0,0,0,0.04);margin-bottom:10px;text-decoration:none;color:var(--tx);font-size:.93em;font-weight:600"><span style="display:flex;align-items:center;gap:10px"><span class="lk-ico"><?php echo m_ico('album',20); ?></span><span>我们的相册</span></span><span style="font-size:.78em;color:var(--tl);background:var(--soft);padding:2px 10px;border-radius:10px"><?php echo count($PH); ?>张</span><span class="ar">›</span></a><?php endif; ?>
+<?php if ($C['show_places'] ?? 1): ?><a href="?p=places" style="display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-radius:12px;background:linear-gradient(var(--card),var(--card)) padding-box,linear-gradient(135deg,#ffc7d8,#ff8eae) border-box;border:1px solid transparent;box-shadow:0 1px 8px rgba(0,0,0,0.04);margin-bottom:10px;text-decoration:none;color:var(--tx);font-size:.93em;font-weight:600"><span style="display:flex;align-items:center;gap:10px"><span class="lk-ico"><?php echo m_ico('place',20); ?></span><span>去过的地方</span></span><span style="font-size:.78em;color:var(--tl);background:var(--soft);padding:2px 10px;border-radius:10px"><?php echo count($PL); ?>个</span><span class="ar">›</span></a><?php endif; ?>
+<?php if ($C['show_todos'] ?? 1): ?><a href="?p=todos" style="display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-radius:12px;background:linear-gradient(var(--card),var(--card)) padding-box,linear-gradient(135deg,#ffc7d8,#ff8eae) border-box;border:1px solid transparent;box-shadow:0 1px 8px rgba(0,0,0,0.04);margin-bottom:10px;text-decoration:none;color:var(--tx);font-size:.93em;font-weight:600"><span style="display:flex;align-items:center;gap:10px"><span class="lk-ico"><?php echo m_ico('todo',20); ?></span><span>一起完成的事</span></span><span style="font-size:.78em;color:var(--tl);background:var(--soft);padding:2px 10px;border-radius:10px"><?php echo $DN.'/'.count($T); ?></span><span class="ar">›</span></a><?php endif; ?>
+
+<?php if (($C['show_comments'] ?? 1) && !empty($P)): ?>
+<div class="sh" style="margin-top:8px"><span class="si"><?php echo m_ico('comment',16); ?></span><span class="st">最新说说</span><span class="sl"></span></div>
+<?php foreach (array_slice($P,0,3) as $po) echo renderPostCard($po, $CM, $n1, $n2, $a1, $a2, $me, $likedComments, true); endif; ?>
+
+<?php if (!empty($PG)): ?>
+<div class="sh" style="margin-top:8px"><span class="si"><?php echo m_ico('quote',16); ?></span><span class="st">更多精彩</span><span class="sl"></span></div>
+<?php foreach($PG as $cpg):?>
+<a href="?p=<?php echo htmlspecialchars($cpg['slug']);?>" style="display:flex;align-items:center;justify-content:space-between;padding:14px 18px;border-radius:12px;background:linear-gradient(var(--card),var(--card)) padding-box,linear-gradient(135deg,#ffc7d8,#ff8eae) border-box;border:1px solid transparent;box-shadow:0 1px 8px rgba(0,0,0,0.04);margin-bottom:10px;text-decoration:none;color:var(--tx);font-size:.93em;font-weight:600"><span style="display:flex;align-items:center;gap:10px"><span style="font-size:1.3em"><?php echo htmlspecialchars($cpg['icon']??'');?></span><span><?php echo htmlspecialchars($cpg['title']);?></span></span><span class="ar">›</span></a>
+<?php endforeach; endif; ?>
+
+<?php if (($C['show_album'] ?? 1) && !empty($PH)): $lp = array_slice($PH,0,4); ?>
+<div class="sh" style="margin-top:8px"><span class="si"><?php echo m_ico('album',16); ?></span><span class="st">最新照片</span><span class="sl"></span></div>
+<div class="ag"><?php foreach($lp as $ph): ?><div class="ai" onclick="l('<?php echo htmlspecialchars($ph['url'],ENT_QUOTES); ?>')"><img src="<?php echo htmlspecialchars($ph['url']); ?>" loading="lazy"><?php if(!empty($ph['title'])):?><div class="cap"><?php echo htmlspecialchars($ph['title']); ?></div><?php endif; ?></div><?php endforeach; ?></div>
+<?php endif; endif; /* end home */ ?>
+
+<?php if ($pg === 'posts' && ($C['show_comments'] ?? 1)): ?>
+<div class="sh"><span class="si"><?php echo m_ico('comment',16); ?></span><span class="st">甜蜜说说</span><span class="sc"><?php echo count($P); ?></span></div>
+<?php if (empty($P)): ?><div class="ncs empty"><div class="ei"><?php echo m_ico('comment',40); ?></div><div class="et">还没有说说<br>去后台发布第一条吧~</div></div>
+<?php else: foreach($P as $po) echo renderPostCard($po, $CM, $n1, $n2, $a1, $a2, $me, $likedComments); endif; endif; ?>
+
+<?php if ($pg === 'album' && ($C['show_album'] ?? 1)): ?>
+<div class="sh"><span class="si"><?php echo m_ico('album',16); ?></span><span class="st">我们的相册</span><span class="sc"><?php echo count($PH); ?>张</span></div>
+<?php if (empty($PH)): ?><div class="ncs empty"><div class="ei"><?php echo m_ico('album',40); ?></div><div class="et">相册还是空的<br>去后台添加照片吧~</div></div>
+<?php else: ?><div class="ag"><?php foreach($PH as $ph): ?><div class="ai" onclick="l('<?php echo htmlspecialchars($ph['url'],ENT_QUOTES); ?>')"><img src="<?php echo htmlspecialchars($ph['url']); ?>" loading="lazy"><?php if(!empty($ph['title'])):?><div class="cap"><?php echo htmlspecialchars($ph['title']); ?></div><?php endif; ?></div><?php endforeach; ?></div><?php endif; endif; ?>
+
+<?php if ($pg === 'places' && ($C['show_places'] ?? 1)): ?>
+<?php $plcCount = 0; $plcJson = []; foreach ($PL as $plx) { if (!empty($plx['lat']) && !empty($plx['lng']) && is_numeric($plx['lat']) && is_numeric($plx['lng'])) { $plcCount++; $plcJson[] = ['lat'=>(float)$plx['lat'], 'lng'=>(float)$plx['lng'], 'name'=>$plx['name']??'', 'note'=>$plx['note']??'', 'img'=>$plx['image']??'']; } } ?>
+<div class="sh"><span class="si"><?php echo m_ico('place',16); ?></span><span class="st">去过的地方</span><span class="sc"><?php echo count($PL); ?>个</span></div>
+<?php if ($plcCount > 0): ?>
+<div class="ncs" style="padding:8px"><div id="footMap" style="height:280px;width:100%;border-radius:12px;z-index:0"></div>
+<script>
+(function(){
+    var spots = <?php echo json_encode($plcJson, JSON_UNESCAPED_UNICODE); ?>;
+    var el = document.getElementById('footMap');
+    if (typeof L === 'undefined' || !el) { if (el) el.innerHTML = '<div style="padding:60px 10px;text-align:center;color:#999;font-size:13px">地图组件未能加载（当前网络无法访问地图 CDN）</div>'; return; }
+    var map = L.map(el).setView([spots[0].lat, spots[0].lng], 5);
+    L.tileLayer('https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}', {subdomains:['1','2','3','4'],maxZoom:18,attribution:''}).addTo(map);
+    var fit = [];
+    spots.forEach(function(s){
+        var mk = L.marker([s.lat, s.lng]).addTo(map);
+        fit.push([s.lat, s.lng]);
+        var html = '<div style="min-width:120px;max-width:220px"><b>' + s.name.replace(/[<>&"]/g,'') + '</b>' + (s.img ? '<br><img src="' + s.img.replace(/[<>&"]/g,'') + '" style="width:100%;max-height:110px;object-fit:cover;border-radius:6px;margin-top:4px">' : '') + (s.note ? '<div style="font-size:12px;color:#555;margin-top:3px">' + s.note.replace(/[<>&"]/g,'').substr(0,60) + '</div>' : '') + '</div>';
+        mk.bindPopup(html);
+    });
+    if (fit.length > 1) map.fitBounds(fit, {padding:[24,24]});
+})();
+</script></div>
+<?php endif; ?>
+<?php if (empty($PL)): ?><div class="ncs empty"><div class="ei"><?php echo m_ico('place',40); ?></div><div class="et">还没有记录一起去过的地方</div></div>
+<?php else: foreach($PL as $pl): ?><div class="ncs plc"><?php if (!empty($pl['image'])): ?><img class="pimg" src="<?php echo htmlspecialchars($pl['image']); ?>" onclick="l('<?php echo htmlspecialchars($pl['image'],ENT_QUOTES); ?>')" loading="lazy"><?php else: ?><div class="pimg ni"><?php echo m_ico('place',26); ?></div><?php endif; ?><div class="pin"><div class="pn"><?php echo htmlspecialchars($pl['name']??'未知地点'); ?></div><div class="pd"><span class="lbl-ico"><?php echo m_ico("clock", 15); ?></span> <?php echo htmlspecialchars($pl['time']??''); ?><?php if (!empty($pl['lat']) && !empty($pl['lng'])): ?> · <span class="lbl-ico"><?php echo m_ico("map", 15); ?></span><?php echo htmlspecialchars($pl['lat']); ?>, <?php echo htmlspecialchars($pl['lng']); ?><?php endif; ?></div><?php if (!empty($pl['note'])): ?><div class="pnote"><?php echo nl2br(htmlspecialchars($pl['note'])); ?></div><?php endif; ?></div></div><?php endforeach; endif; endif; ?>
+
+<?php if ($pg === 'todos' && ($C['show_todos'] ?? 1)): ?>
+<div class="sh"><span class="si"><?php echo m_ico('todo',16); ?></span><span class="st">一起完成的事</span><span class="sc"><?php echo $DN.'/'.count($T); ?></span></div>
+<?php if (empty($T)): ?><div class="ncs empty"><div class="ei"><?php echo m_ico('todo',40); ?></div><div class="et">清单还是空的<br>去后台添加想一起做的事吧~</div></div>
+<?php else: usort($T,function($a,$b){return ($a['done']??0)-($b['done']??0)?:strtotime($b['time'])-strtotime($a['time']);}); foreach($T as $td): $isd=!empty($td['done']); ?>
+<div class="ti"><div class="tc2 <?php echo $isd?'done':''; ?>"><?php echo $isd?'✅':'⬜'; ?></div><div class="tcnt"><div class="tt <?php echo $isd?'dt':''; ?>"><?php echo htmlspecialchars($td['title']); ?></div><div class="tm"><?php echo $isd?'✅ 已完成 · '.htmlspecialchars($td['done_time']??''):'📝 创建于 '.htmlspecialchars($td['time']??''); ?></div><?php if (!empty($td['note'])): ?><div class="tnote"><?php echo htmlspecialchars($td['note']); ?></div><?php endif; ?></div></div>
+<?php endforeach; endif; endif; ?>
+
+<?php if ($pg === 'post'): $postId = $_GET['id'] ?? ''; $postDetail = null;
+    foreach ($P as $po) { if ($po['id'] === $postId) { $postDetail = $po; break; } }
+    if ($postDetail):
+        echo renderPostCard($postDetail, $CM, $n1, $n2, $a1, $a2, $me, $likedComments, false, true);
+        $rwx = $C['reward_wx_img'] ?? ''; $rali = $C['reward_alipay_img'] ?? '';
+        if ($rwx !== '' || $rali !== ''): ?>
+<div class="reward-bar" style="text-align:center;margin-top:14px"><button type="button" class="reward-btn" onclick="openReward()"><?php echo m_ico('gift',17); ?> 赞赏</button></div>
+<?php endif; else: ?>
+<div class="ncs empty"><div class="ei"><?php echo m_ico('alert',40); ?></div><div class="et">说说不存在</div></div>
+<?php endif; endif; ?>
+<?php if ($pg === 'post'): ?>
+<div class="back" style="text-align:center;margin-top:20px"><a href="?p=posts" style="color:var(--pri);text-decoration:none;font-size:.9em;display:inline-flex;align-items:center;gap:6px"><?php echo m_ico('reply',14); ?> 返回说说列表</a></div>
+<?php endif; ?>
+
+<?php if ($isCustomPage): ?>
+<div class="sh"><span class="si"><?php echo htmlspecialchars($cp['icon']??'');?></span><span class="st"><?php echo htmlspecialchars($cp['title']);?></span></div>
+<div class="nc cp-content"><?php echo $cp['content'] ?? '<p>暂无内容</p>'; ?></div>
+<?php endif; ?>
+
+<?php if ($me): ?>
+<div class="nc" id="post_box" style="display:none">
+<div class="card-title" style="font-size:1.05em;font-weight:700;color:var(--tx);margin-bottom:14px"><?php echo m_ico('edit',18); ?> 发说说</div>
+<?php if ($userPostMsg): ?><div style="padding:10px 14px;border-radius:10px;margin-bottom:12px;font-size:.85em;background:var(--ok);color:var(--oktx)"><?php echo m_ico('check',14); ?> <?php echo htmlspecialchars($userPostMsg); ?></div><?php endif; ?>
+<?php if ($userPostErr): ?><div style="padding:10px 14px;border-radius:10px;margin-bottom:12px;font-size:.85em;background:var(--err);color:var(--errtx)"><?php echo m_ico('alert',14); ?> <?php echo htmlspecialchars($userPostErr); ?></div><?php endif; ?>
+<form method="post" enctype="multipart/form-data">
+<?php echo csrf_field(); ?>
+<input type="hidden" name="act" value="user_post">
+<div class="fg"><label><?php echo m_ico('comment',14); ?> 说点什么</label><textarea name="content" rows="3" placeholder="分享你的想法..." required maxlength="2000" style="width:100%;padding:11px 15px;background:var(--input);border:none;border-radius:10px;box-shadow:inset 2px 2px 6px rgba(0,0,0,0.04);font-size:.92em;color:var(--tx);outline:none;font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;resize:vertical"></textarea></div>
+<div style="display:flex;gap:10px;flex-wrap:wrap">
+<label style="flex:1;min-width:120px"><span style="font-size:.78em;color:var(--tl)"><?php echo m_ico('camera',13); ?> 图片（可多选）</span><input type="file" name="images[]" multiple style="width:100%;margin-top:4px;font-size:.8em"></label>
+<label style="flex:1;min-width:120px"><span style="font-size:.78em;color:var(--tl)"><?php echo m_ico('video',13); ?> 视频</span><input type="file" name="video" accept="video/*" style="width:100%;margin-top:4px;font-size:.8em"></label>
+<label style="flex:1;min-width:120px"><span style="font-size:.78em;color:var(--tl)"><?php echo m_ico('music',13); ?> 音乐</span><input type="file" name="music" accept="audio/*" style="width:100%;margin-top:4px;font-size:.8em"></label>
+</div>
+<button type="submit" style="margin-top:14px;padding:10px 24px;border:none;border-radius:10px;font-size:.9em;font-weight:700;cursor:pointer;background:var(--card);box-shadow:0 2px 8px rgba(0,0,0,0.06);color:var(--pri)"><?php echo m_ico('send',15); ?> 发布</button>
+</form>
+</div>
+<?php endif; ?>
+
+<div class="ft">
+<p><?php echo beian_render($bn); ?></p>
+<?php if (!empty($C['footer'])): ?><p><?php echo md_render($C['footer']); ?></p><?php endif; ?>
+<!-- 版权标识：© 2026 情侣小窝（开源项目，请保留此标识） -->
+<p>© 2026 情侣小窝 · <a href="https://github.com/yuxx0824/Love-Nook">开源版</a></p>
+</div>
+</div>
+
+<nav class="bn">
+<?php echo NI('home',$pg,'home'); ?>
+<?php echo NI('posts',$pg,'comment'); ?>
+<?php echo NI('album',$pg,'album'); ?>
+<?php echo NI('places',$pg,'place'); ?>
+<?php echo NI('todos',$pg,'todo'); ?>
+<?php foreach($PG as $cpg): ?>
+<a href="?p=<?php echo htmlspecialchars($cpg['slug']);?>"<?php echo $pg===$cpg['slug']?' class="active"':'';?>><span class="ni"><?php echo htmlspecialchars($cpg['icon']??'');?></span><span class="nl"><?php echo htmlspecialchars($cpg['title']);?></span></a>
+<?php endforeach; ?>
+<?php if ($me): ?>
+<a href="#" onclick="document.getElementById('post_box').style.display='block';document.getElementById('post_box').scrollIntoView({behavior:'smooth'})" style="color:var(--oktx)"><span class="ni"><?php echo m_ico('edit',18); ?></span><span class="nl">发说说</span></a>
+<a href="user.php"><span class="ni"><?php echo m_ico('user',18); ?></span><span class="nl"><?php echo htmlspecialchars($me['nickname']); ?></span></a>
+<a href="?act=logout"><span class="ni"><?php echo m_ico('logout',18); ?></span><span class="nl">退出</span></a>
+<?php else: ?>
+<a href="login.php"><span class="ni"><?php echo m_ico('lock',18); ?></span><span class="nl">登录</span></a>
+<?php endif; ?>
+<?php if (isset($_SESSION['cp_admin'])): ?>
+<a href="admin/index.php"><span class="ni"><?php echo m_ico('config',18); ?></span><span class="nl">管理</span></a>
+<?php endif; ?>
+</nav>
+
+<div class="lb" id="lbx" onclick="this.classList.remove('show')"><span class="lcl">&times;</span><img id="lbi" src=""></div>
+<?php $rwxQ = $C['reward_wx_img'] ?? ''; $raliQ = $C['reward_alipay_img'] ?? ''; if ($rwxQ !== '' || $raliQ !== ''): ?>
+<div class="reward-mask" id="rewardMask" onclick="if(event.target===this)closeReward()">
+<div class="reward-modal">
+<div class="reward-head"><?php echo m_ico('gift',17); ?> 赞赏支持</div>
+<div class="reward-tabs">
+<button type="button" class="rtab active" id="rtab-wx" onclick="switchReward('wx')">微信</button>
+<button type="button" class="rtab" id="rtab-ali" onclick="switchReward('ali')">支付宝</button>
+</div>
+<div class="reward-body" id="rbody-wx"><?php if ($rwxQ !== ''): ?><img src="<?php echo htmlspecialchars($rwxQ); ?>" class="reward-qr" alt="微信收款码"><div class="reward-tip">微信扫一扫，赞赏支持</div><?php else: ?><div class="reward-empty">暂未配置微信收款码</div><?php endif; ?></div>
+<div class="reward-body" id="rbody-ali" style="display:none"><?php if ($raliQ !== ''): ?><img src="<?php echo htmlspecialchars($raliQ); ?>" class="reward-qr" alt="支付宝收款码"><div class="reward-tip">支付宝扫一扫，赞赏支持</div><?php else: ?><div class="reward-empty">暂未配置支付宝收款码</div><?php endif; ?></div>
+<button type="button" class="reward-close" onclick="closeReward()">关 闭</button>
+</div>
+</div>
+<?php endif; ?>
+<script>
+function l(s){event.stopPropagation();document.getElementById('lbi').src=s;document.getElementById('lbx').classList.add('show')}
+!function(){var c=document.getElementById('pcs'),e=['❤️','💕','💖','💗','💝','✨','🌸','💫','🕊️'];setInterval(function(){var p=document.createElement('span');p.className='pt';p.textContent=e[Math.floor(Math.random()*e.length)];p.style.left=Math.random()*100+'%';p.style.animationDuration=(4+Math.random()*6)+'s';p.style.fontSize=(14+Math.random()*22)+'px';c.appendChild(p);setTimeout(function(){p.remove()},8000)},500)}();
+function showReplyForm(parentId, nick, postId) {
+    var rf = document.getElementById('reply-form-' + postId);
+    var pf = document.getElementById('reply-parent-' + postId);
+    var rt = document.getElementById('reply-text-' + postId);
+    var ib = document.getElementById('cmt-input-bar-' + postId);
+    if (rf && pf && rt) {
+        pf.value = parentId;
+        rt.placeholder = '回复 @' + nick + '…';
+        rf.style.display = 'block';
+        if (ib) ib.style.display = 'none';
+        rt.focus();
+    }
+}
+function hideReplyForm(postId) {
+    var rf = document.getElementById('reply-form-' + postId);
+    var ib = document.getElementById('cmt-input-bar-' + postId);
+    if (rf) rf.style.display = 'none';
+    if (ib) ib.style.display = '';
+}
+function editComment(cid, postId) {
+    var ef = document.getElementById('cmt-edit-' + cid);
+    if (ef) {
+        ef.style.display = 'block';
+        // 隐藏评论输入栏
+        var ib = document.getElementById('cmt-input-bar-' + postId);
+        if (ib) ib.style.display = 'none';
+    }
+}
+function cancelEdit(cid, postId) {
+    var ef = document.getElementById('cmt-edit-' + cid);
+    if (ef) ef.style.display = 'none';
+    var ib = document.getElementById('cmt-input-bar-' + postId);
+    if (ib) ib.style.display = '';
+}
+setInterval(function(){var el=document.getElementById('dc');if(el){var ld=new Date('<?php echo htmlspecialchars($ld); ?>T00:00:00'),df=Math.floor((Date.now()-ld)/86400000);if(el.textContent!=df){el.style.transform='scale(1.15)';el.textContent=df;setTimeout(function(){el.style.transform='scale(1)'},300)}}},60000);
+
+// 点赞
+(function(){
+var liked=JSON.parse(localStorage.getItem('cmt_liked')||'{}');
+document.addEventListener('click',function(e){
+    var btn=e.target.closest('.cmt-like-btn');
+    if(!btn) return;
+    e.preventDefault();
+    var cid=btn.getAttribute('data-cid');
+    <?php if ($me): ?>
+    fetch('like.php',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({comment_id:cid,_csrf:'<?php echo csrf_token(); ?>',type:btn.classList.contains('dislike-heart')?'dislike':'like'})
+    }).then(function(r){return r.json()}).then(function(d){
+        if(d.error){alert(d.error);return}
+        // 更新两个爱心的状态
+        var parentActions = btn.closest('.cmt-like-actions');
+        if(!parentActions) return;
+        var likeHeart = parentActions.querySelector('.like-heart');
+        var dislikeHeart = parentActions.querySelector('.dislike-heart');
+        var likeNum = likeHeart ? likeHeart.querySelector('.cmt-like-num') : null;
+        // 根据返回的 type 设置状态
+        if(likeHeart) likeHeart.classList.toggle('liked', d.type === 'like');
+        if(dislikeHeart) dislikeHeart.classList.toggle('liked', d.type === 'dislike');
+        if(likeNum) likeNum.textContent = d.count || '';
+    }).catch(function(e){console.error(e)});
+    <?php else: ?>
+    // 未登录用localStorage临时记录
+    var isLiked=liked[cid];
+    var parentActions = btn.closest('.cmt-like-actions');
+    if(!parentActions) return;
+    var likeHeart = parentActions.querySelector('.like-heart');
+    var likeNum = likeHeart ? likeHeart.querySelector('.cmt-like-num') : null;
+    var cur=parseInt(likeNum ? likeNum.textContent : '0')||0;
+    if(isLiked){
+        delete liked[cid];
+        if(likeHeart) likeHeart.classList.remove('liked');
+        cur=Math.max(0,cur-1);
+    }else{
+        liked[cid]=true;
+        if(likeHeart) likeHeart.classList.add('liked');
+        cur++;
+    }
+    if(likeNum) likeNum.textContent = cur || '';
+    localStorage.setItem('cmt_liked',JSON.stringify(liked));
+    <?php endif; ?>
+});
+})();
+
+// 展开/收起回复
+function toggleReplies(btn,cid){
+    var list=btn.parentElement.querySelector('.cmt-replies-list');
+    if(!list) return;
+    var total=list.querySelectorAll('.cmt-item').length;
+    if(list.style.display==='none'){
+        list.style.display='';
+        btn.textContent='收起回复 ▴';
+    }else{
+        list.style.display='none';
+        btn.textContent='展开 '+total+' 条回复 ▾';
+    }
+}
+
+// 常用表情列表
+const EMOJIS = ['😀','😃','😄','😁','😆','😅','🤣','😂','🙂','😊','😇','🥰','😍','🤩','😘','😗','😚','😋','😛','😜','🤪','😝','🤑','🤗','🤭','🤫','🤔','🤐','🤨','😐','😑','😶','😏','😒','🙄','😬','🤥','😌','😔','😪','🤤','😴','😷','🤒','🤕','🤢','🤮','🥴','😵','🤯','🥳','🥺','😢','😭','😤','😠','😡','🤬','💕','❤️','🧡','💛','💚','💙','💜','🖤','💗','💖','✨','🌟','⭐','🔥','💯','🎉','🎊','🎈','🎁','💪','👍','👎','👏','🙌','🤝','👋','✌️','🤞','🤟','🫶','🌹','🥀','🌸','🌺','🌻','🌷','🌿','🍀','🐱','🐶','🐰','🦊','🐻','🐼','🐨','🐒','😺','😸','😹','😻','😽','🙀','😿','😾'];
+
+// 切换表情面板
+function toggleEmoji(btn, inputId) {
+    var panel = btn.closest('.cmt-input-bar,.cmt-reply-form,.cmt-edit-form').querySelector('.cmt-emoji-panel');
+    if (!panel) return;
+    if (panel.style.display === 'block') {
+        panel.style.display = 'none';
+        return;
+    }
+    // 关闭其他面板
+    document.querySelectorAll('.cmt-emoji-panel').forEach(function(p) { p.style.display = 'none'; });
+    // 填充表情
+    if (!panel._filled) {
+        var html = '';
+        EMOJIS.forEach(function(e) { html += '<span data-emoji="' + e + '">' + e + '</span>'; });
+        panel.innerHTML = html;
+        panel._filled = true;
+    }
+    panel.style.display = 'block';
+}
+
+// 插入表情
+function insertEmoji(event, panel, inputId) {
+    var target = event.target;
+    if (target.tagName !== 'SPAN' || !target.dataset.emoji) return;
+    var input = document.getElementById(inputId);
+    if (!input) return;
+    var emoji = target.dataset.emoji;
+    // 支持 input[type=text] 和 textarea
+    if (input.selectionStart !== undefined) {
+        var start = input.selectionStart;
+        var end = input.selectionEnd;
+        input.value = input.value.substring(0, start) + emoji + input.value.substring(end);
+        input.selectionStart = input.selectionEnd = start + emoji.length;
+    } else {
+        input.value += emoji;
+    }
+    input.focus();
+    // 不关闭面板，用户可连续选
+}
+
+// 点击页面其他地方关闭表情面板
+document.addEventListener('click', function(e) {
+    if (!e.target.closest('.cmt-emoji-panel') && !e.target.closest('.cmt-emoji-btn')) {
+        document.querySelectorAll('.cmt-emoji-panel').forEach(function(p) { p.style.display = 'none'; });
+    }
+});
+
+// 图片直链插入
+function insertImageUrl(inputId) {
+    var url = prompt('请输入图片直链链接（支持 jpg/png/gif/webp）：');
+    if (url && url.trim()) {
+        url = url.trim();
+        var input = document.getElementById(inputId);
+        if (!input) return;
+        var ins = ' [图片]' + url + ' ';
+        if (input.tagName === 'TEXTAREA') {
+            var start = input.selectionStart, end = input.selectionEnd;
+            input.value = input.value.substring(0, start) + ins + input.value.substring(end);
+            input.selectionStart = input.selectionEnd = start + ins.length;
+        } else {
+            input.value += ins;
+        }
+        input.focus();
+    }
+}
+
+// 主题切换（奶白/黑夜）
+(function(){
+    var KEY='site_theme';
+    function apply(t){
+        document.documentElement.setAttribute('data-theme',t);
+        var b=document.getElementById('themeToggle');
+        if(b){ b.innerHTML = (t==='dark') ? '<?php echo m_ico('sun',17); ?>' : '<?php echo m_ico('moon',17); ?>'; }
+    }
+    var saved=localStorage.getItem(KEY);
+    apply(saved==='dark' ? 'dark' : 'milk');
+    window.toggleTheme=function(){
+        var cur=document.documentElement.getAttribute('data-theme');
+        var next=(cur==='dark') ? 'milk' : 'dark';
+        localStorage.setItem(KEY,next);
+        apply(next);
+    };
+})();
+</script>
+</body>
+</html>
